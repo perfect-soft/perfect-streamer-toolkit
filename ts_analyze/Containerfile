@@ -1,0 +1,18 @@
+# Copyright 2026 Perfect Soft
+# SPDX-License-Identifier: Apache-2.0
+# Fully static Linux x86_64 ts_analyze (musl). Usage:
+#   podman build -f Containerfile -o type=local,dest=dist .
+# The binary lands in dist/ts_analyze.
+FROM docker.io/library/alpine:3.20 AS build
+RUN apk add --no-cache build-base cmake python3
+WORKDIR /src
+COPY CMakeLists.txt ./
+COPY include include
+COPY src src
+COPY tests tests
+RUN cmake -S . -B /build -DCMAKE_BUILD_TYPE=Release -DTS_ANALYZE_STATIC=ON \
+ && cmake --build /build -j4 \
+ && ctest --test-dir /build --output-on-failure
+
+FROM scratch
+COPY --from=build /build/ts_analyze /ts_analyze

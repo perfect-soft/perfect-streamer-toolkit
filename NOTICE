@@ -1,0 +1,15 @@
+Perfect Streamer Toolkit
+Copyright 2026 Perfect Soft
+
+This product includes software developed by Perfect Soft for the
+Perfect Streamer project (https://meshwork.pstreamer.tv).
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Third-party software
+--------------------
+ts_analyze is linked statically with libdvbpsi (https://www.videolan.org/developers/libdvbpsi.html),
+Copyright (C) 2001-2012 VideoLAN, licensed under the GNU Lesser General
+Public License version 2.1 or later. libdvbpsi is not part of this
+repository: the build downloads the upstream release or uses the system
+library. Its source code is available from VideoLAN.
