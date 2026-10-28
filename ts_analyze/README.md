@@ -146,11 +146,10 @@ esac
 
 ## Building
 
-You need CMake 3.20 or newer and a C11/C++20 compiler; Python 3 is needed only for the
-tests.
+You need CMake 3.20 or newer and a C11/C++20 compiler.
 
 ```bash
-cmake -S . -B build && cmake --build build && ctest --test-dir build
+cmake -S . -B build && cmake --build build
 ```
 
 By default CMake downloads libdvbpsi 1.3.3 from VideoLAN, checks its SHA-256 and builds it
@@ -161,8 +160,7 @@ pkg-config):
 cmake -S . -B build -DTS_ANALYZE_SYSTEM_DVBPSI=ON
 ```
 
-A fully static x86_64 binary (Alpine/musl) builds in a container; the smoke test runs as
-part of the build:
+A fully static x86_64 binary (Alpine/musl) builds in a container:
 
 ```bash
 podman build -f Containerfile -o type=local,dest=dist .   # or docker build

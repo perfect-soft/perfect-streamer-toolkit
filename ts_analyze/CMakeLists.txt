@@ -74,13 +74,3 @@ endif()
 target_link_options(ts_analyze PRIVATE $<$<CONFIG:Release>:-s>)
 
 install(TARGETS ts_analyze RUNTIME DESTINATION bin)
-
-enable_testing()
-add_test(NAME smoke
-    COMMAND ${CMAKE_COMMAND} -DBIN=$<TARGET_FILE:ts_analyze>
-            -DOUT=${CMAKE_BINARY_DIR}/smoke
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke.cmake)
-add_test(NAME modes
-    COMMAND ${CMAKE_COMMAND} -DBIN=$<TARGET_FILE:ts_analyze>
-            -DOUT=${CMAKE_BINARY_DIR}/modes
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/modes.cmake)

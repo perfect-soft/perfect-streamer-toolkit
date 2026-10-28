@@ -2,7 +2,7 @@
 
 Small command-line tools for MPEG transport streams, from the
 [Perfect Streamer](https://meshwork.pstreamer.tv) project. Each tool lives in its own
-folder with its own README, build files and tests.
+folder with its own README and build files.
 
 ## Tools
 
