@@ -7,6 +7,7 @@
 # VideoLAN release tarball, fetched and checked by SHA-256 and compiled into a
 # static library. -DTS_ANALYZE_STATIC=ON links a fully static binary (needs a
 # static libc: musl, e.g. the Alpine container in Containerfile).
+# -DTS_ANALYZE_ST2022_DIR names the directory of the ST 2022 classes.
 cmake_minimum_required(VERSION 3.20)
 project(ts_analyze C CXX)
 
@@ -63,11 +64,20 @@ else()
     target_compile_options(ts_dvbpsi PRIVATE -w)
 endif()
 
+# ST 2022-1 FEC decoder and ST 2022-7 merge (pure classes, no I/O).
+set(TS_ANALYZE_ST2022_DIR "${CMAKE_CURRENT_SOURCE_DIR}/st2022"
+    CACHE PATH "Directory of fec_decoder and rtp_merge")
+add_library(ts_st2022 STATIC
+    ${TS_ANALYZE_ST2022_DIR}/fec_decoder.cpp
+    ${TS_ANALYZE_ST2022_DIR}/rtp_merge.cpp)
+target_include_directories(ts_st2022 PUBLIC ${TS_ANALYZE_ST2022_DIR})
+target_compile_options(ts_st2022 PRIVATE -Wall -Wextra -Werror)
+
 add_executable(ts_analyze src/main.cpp)
 target_include_directories(ts_analyze PRIVATE include)
 target_compile_options(ts_analyze PRIVATE -Wall -Wextra -Werror -Wcast-align
     -Wenum-compare -fmessage-length=0)
-target_link_libraries(ts_analyze PRIVATE ts_dvbpsi)
+target_link_libraries(ts_analyze PRIVATE ts_dvbpsi ts_st2022)
 if(TS_ANALYZE_STATIC)
     target_link_options(ts_analyze PRIVATE -static)
 endif()

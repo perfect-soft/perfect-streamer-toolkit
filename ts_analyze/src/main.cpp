@@ -22,9 +22,8 @@
  *   -f, --full                    — full detailed report (default)
  *   -b, --bitrate <Mbit/s>        — hint TS bitrate for file mode (default: 38.8)
  *   -p, --pcr-pid <pid>           — analyze only this PCR PID (decimal or 0xHHHH)
- *   -l, --pcr-limit <ms>          — PCR interval error limit in ms (default: 40)
- *       --no-eit                  — skip EIT analysis (P3.7..P3.10 → N/A)
- *       --no-nit                  — skip NIT analysis (P3.1, P3.2 → N/A)
+ *       --no-eit                  — skip EIT analysis (3.6a, 3.6b, EIT.sch_* → N/A)
+ *       --no-nit                  — skip NIT analysis (3.1a, 3.1b → N/A)
  *       --no-color                — disable ANSI color output for status verdicts
  *       --xml                     — emit structured XML report on stdout
  *                                   (suppresses diagnostic chatter; errors stay on stderr)
@@ -48,6 +47,8 @@
 #include "iat_analyzer.h"
 #include "report.h"
 #include "xml_report.h"
+#include "json_report.h"
+#include "st2022_input.h"
 #include "version.h"
 
 #include <iostream>
@@ -69,9 +70,14 @@ static void signal_handler(int sig)
 }
 
 // ─── Usage ──────────────────────────────────────────────────────────
+#define TS_ANALYZE_ATTRIBUTION \
+    "part of the Perfect Streamer Toolkit by Perfect Soft for Perfect Streamer Meshwork" \
+    " — https://meshwork.pstreamer.tv"
+
 static void print_usage(const char *prog)
 {
-    std::cerr << "MPEG-TS Analyzer v" TS_ANALYZE_VERSION " — TR 101 290 (Perfect Streamer Toolkit https://meshwork.pstreamer.tv)\n"
+    std::cerr << "MPEG-TS Analyzer v" TS_ANALYZE_VERSION " — TR 101 290\n"
+            << TS_ANALYZE_ATTRIBUTION "\n"
             << "\n" << "Usage: " << prog << " [options] <input>\n" << "\n" << "Input:\n"
             << "  udp://239.1.1.1:1234          UDP multicast stream\n"
             << "  udp://eth0@239.1.1.1:1234     UDP multicast on interface\n"
@@ -83,12 +89,19 @@ static void print_usage(const char *prog)
             << "  -f, --full             Full detailed report (default)\n"
             << "  -b, --bitrate <Mbps>   TS bitrate hint for file mode (default: 38.8)\n"
             << "  -p, --pcr-pid <pid>    Analyze specific PCR PID (decimal or 0xHHHH)\n"
-            << "  -l, --pcr-limit <ms>   PCR interval error limit in ms (default: 40)\n"
-            << "      --no-eit           Skip EIT analysis (P3.7..P3.10 reported as N/A)\n"
-            << "      --no-nit           Skip NIT analysis (P3.1, P3.2 reported as N/A)\n"
+            << "      --no-eit           Skip EIT analysis (3.6a, 3.6b, EIT.sch_* reported as N/A)\n"
+            << "      --no-nit           Skip NIT analysis (3.1a, 3.1b reported as N/A)\n"
             << "      --no-color         Disable ANSI color output for status verdicts\n"
             << "      --xml              Emit structured XML on stdout (quiet stderr)\n"
+            << "      --json             Emit compact JSON on stdout: verdict, problems with times (quiet stderr)\n"
+            << "      --wait-s <s>       UDP: wait this long for the first datagram (default: 10)\n"
+            << "  -V, --version          Show the version\n"
             << "  -h, --help             Show this help\n"
+            << "\n" << "RTP, ST 2022-1 FEC, ST 2022-7 (udp:// input only; off by default):\n"
+            << "      --rtp              The input is RTP: sequence, loss, payload type, SSRC\n"
+            << "      --fec              ST 2022-1 FEC: column on port+2, row on port+4 (implies --rtp)\n"
+            << "      --path2 <udp://..> ST 2022-7: the second path of the stream (implies --rtp)\n"
+            << "      --path-skew-ms <n> Largest path skew waited for and allowed (default: 450)\n"
             << "\n" << "TR 101 290 checks:\n"
             << "  Priority 1: sync, CC, PAT/PMT interval, PID presence\n"
             << "  Priority 2: TEI, CRC, PCR interval/accuracy/discont, PTS, CAT\n"
@@ -146,13 +159,16 @@ int main(int argc, char *argv[])
     Report::Mode report_mode = Report::FULL;
     double bitrate_mbps = 0.0;
     uint16_t forced_pid = 0xFFFF;   // 0xFFFF = auto-detect
-    double pcr_limit_ms = 0.0;      // 0 = use TR 101 290 default (40 ms)
     bool   xml_mode    = false;     // --xml: structured stdout, quiet stderr
+    bool   json_mode   = false;     // --json: compact JSON on stdout, quiet stderr
     bool   no_eit      = false;     // --no-eit: skip EIT analysis
     bool   no_nit      = false;     // --no-nit: skip NIT analysis
+    St2022Options st2022;           // --rtp / --fec / --path2 / --path-skew-ms
+    double wait_s      = 10.0;      // --wait-s: live input, wait for the first datagram
 
     // Long-only option codes (values outside short-option alphabet)
-    enum { OPT_NO_COLOR = 1000, OPT_XML, OPT_NO_EIT, OPT_NO_NIT };
+    enum { OPT_NO_COLOR = 1000, OPT_XML, OPT_NO_EIT, OPT_NO_NIT,
+           OPT_RTP, OPT_FEC, OPT_PATH2, OPT_PATH_SKEW, OPT_WAIT, OPT_JSON };
 
     static struct option long_opts[] =
     {
@@ -166,11 +182,18 @@ int main(int argc, char *argv[])
     { "no-eit", no_argument, nullptr, OPT_NO_EIT },
     { "no-nit", no_argument, nullptr, OPT_NO_NIT },
     { "xml", no_argument, nullptr, OPT_XML },
+    { "json", no_argument, nullptr, OPT_JSON },
+    { "rtp", no_argument, nullptr, OPT_RTP },
+    { "fec", no_argument, nullptr, OPT_FEC },
+    { "path2", required_argument, nullptr, OPT_PATH2 },
+    { "path-skew-ms", required_argument, nullptr, OPT_PATH_SKEW },
+    { "wait-s", required_argument, nullptr, OPT_WAIT },
     { "help", no_argument, nullptr, 'h' },
+    { "version", no_argument, nullptr, 'V' },
     { nullptr, 0, nullptr, 0 } };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "t:sfb:p:l:h", long_opts, nullptr)) != -1)
+    while ((opt = getopt_long(argc, argv, "t:sfb:p:l:hV", long_opts, nullptr)) != -1)
     {
         switch (opt)
         {
@@ -190,8 +213,9 @@ int main(int argc, char *argv[])
             forced_pid = parse_pid(optarg);
             break;
         case 'l':
-            pcr_limit_ms = std::atof(optarg);
-            break;
+            std::cerr << "Error: -l/--pcr-limit is not supported: the PCR repetition check (2.3)"
+                         " uses the TR 101 290 limit of 40 ms\n";
+            return 1;
         case OPT_NO_COLOR:
             Color::enabled = false;
             break;
@@ -199,14 +223,46 @@ int main(int argc, char *argv[])
             xml_mode = true;
             Color::enabled = false;   // ANSI escapes are nonsense inside XML
             break;
+        case OPT_JSON:
+            json_mode = true;
+            Color::enabled = false;
+            break;
         case OPT_NO_EIT:
             no_eit = true;
             break;
         case OPT_NO_NIT:
             no_nit = true;
             break;
+        case OPT_RTP:
+            st2022.rtp = true;
+            break;
+        case OPT_FEC:
+            st2022.fec = true;
+            break;
+        case OPT_PATH2:
+            st2022.path2 = optarg;
+            break;
+        case OPT_WAIT:
+            wait_s = std::atof(optarg);
+            if (wait_s <= 0 || wait_s > 3600)
+            {
+                std::cerr << "Error: --wait-s must be in 0..3600\n";
+                return 1;
+            }
+            break;
+        case OPT_PATH_SKEW:
+            st2022.path_skew_ms = std::atof(optarg);
+            if (st2022.path_skew_ms <= 0 || st2022.path_skew_ms > 10000)
+            {
+                std::cerr << "Error: --path-skew-ms must be in 1..10000\n";
+                return 1;
+            }
+            break;
         case 'h':
             print_usage(argv[0]);
+            return 0;
+        case 'V':
+            std::cout << "ts_analyze " TS_ANALYZE_VERSION "\n" TS_ANALYZE_ATTRIBUTION "\n";
             return 0;
         default:
             print_usage(argv[0]);
@@ -221,6 +277,15 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    if (xml_mode && json_mode)
+    {
+        std::cerr << "Error: --xml and --json cannot be combined\n";
+        return 1;
+    }
+    const bool quiet = xml_mode || json_mode;   // structured stdout: no chatter on stderr
+    if (json_mode)
+        Events::get().enable();
+
     std::string raw_input = argv[optind];
     std::string uri, iface;
     parse_input_uri(raw_input, uri, iface);
@@ -231,12 +296,37 @@ int main(int argc, char *argv[])
 
     // ── Open input ──────────────────────────────────────────────────
     std::unique_ptr<TsInput> input;
+    St2022Input *st2022_input = nullptr;
     try
     {
-        input = create_input(uri, iface, bitrate_mbps);
+        if (st2022.enabled())
+        {
+            if (uri.substr(0, 6) != "udp://")
+            {
+                std::cerr << "Error: --rtp, --fec and --path2 need a udp:// input\n";
+                return 1;
+            }
+            St2022Input::Path p1 { uri, iface }, p2;
+            if (!st2022.path2.empty())
+            {
+                parse_input_uri(st2022.path2, p2.uri, p2.iface);
+                if (p2.uri.substr(0, 6) != "udp://")
+                {
+                    std::cerr << "Error: --path2 needs a udp:// URI\n";
+                    return 1;
+                }
+            }
+            auto in = std::make_unique<St2022Input>(st2022, p1, st2022.path2.empty() ? nullptr : &p2);
+            st2022_input = in.get();
+            input = std::move(in);
+        }
+        else
+            input = create_input(uri, iface, bitrate_mbps);
     } catch (const std::exception &e)
     {
         std::cerr << "Error: " << e.what() << "\n";
+        if (json_mode)
+            JsonReport::print_error(std::cout, 1, e.what(), raw_input);
         return 1;
     }
 
@@ -246,7 +336,7 @@ int main(int argc, char *argv[])
     if (input->span_s() > 0.0 && input->span_s() < expected_s)
         expected_s = input->span_s();
 
-    if (!xml_mode)
+    if (!quiet)
     {
         std::cerr << "MPEG-TS Analyzer v" TS_ANALYZE_VERSION " — TR 101 290"
                      " (Perfect Streamer Toolkit https://meshwork.pstreamer.tv)\n"
@@ -279,12 +369,11 @@ int main(int argc, char *argv[])
 
     bool is_file_mode = (uri.substr(0, 6) != "udp://");
     analyzer.set_file_mode(is_file_mode);
-    if (pcr_limit_ms > 0.0)
-        analyzer.set_pcr_interval_limit(pcr_limit_ms / 1000.0);
 
     // IAT (network jitter) only applies to live network sources.
     if (input->is_network())
         input->set_iat_analyzer(&iat_analyzer);
+    input->set_first_wait(wait_s);
 
     std::set<uint16_t> active_pcr_pids;
     if (forced_pid != 0xFFFF)
@@ -295,7 +384,7 @@ int main(int argc, char *argv[])
     bool tstd_es_initialized = false;
     bool pts_es_initialized = false;
 
-    // PIDs referenced by SI — for P3.4 unreferenced PID detection (don't flag these)
+    // PIDs referenced by SI — for 3.4 unreferenced PID detection (don't flag these)
     std::set<uint16_t> referenced_pids;
     // Well-known SI PIDs are always considered referenced (not flagged as unreferenced)
     referenced_pids.insert(TS_PID_PAT);
@@ -307,7 +396,7 @@ int main(int argc, char *argv[])
     referenced_pids.insert(TS_PID_RST);
     referenced_pids.insert(TS_PID_TDT);
 
-    // PIDs expected to be present — for P1.6 PID absence check (must appear in stream)
+    // PIDs expected to be present — for 1.6 PID absence check (must appear in stream)
     // Only PAT is unconditionally required; PMT/PCR/ES PIDs added after SI discovery
     std::set<uint16_t> expected_pids;
     expected_pids.insert(TS_PID_PAT);
@@ -316,6 +405,7 @@ int main(int argc, char *argv[])
     uint8_t pkt[TS_PACKET_SIZE];
     double arrival = 0;
     double start_time = 0;
+    double start_utc = 0;           // wall clock of the first packet (live input)
     bool started = false;
     int64_t pkt_count = 0;
     // Skip the very first progress update (elapsed≈0): "PCR PIDs discovered"
@@ -334,18 +424,33 @@ int main(int argc, char *argv[])
         {
             start_time = arrival;
             started = true;
-            if (!xml_mode)
+            Events::get().set_origin(start_time);
+            if (input->is_network())
+            {
+                struct timespec rt;
+                clock_gettime(CLOCK_REALTIME, &rt);
+                start_utc = rt.tv_sec + rt.tv_nsec * 1e-9 - (monotonic_time() - start_time);
+            }
+            if (!quiet)
                 std::cerr << "Stream locked.\n";
         }
 
         double elapsed = arrival - start_time;
         if (elapsed >= duration_s)
             break;
+        Events::get().set_now(elapsed);
 
         pkt_count++;
 
         // ── TR 101 290 P1 low-level checks (every packet) ──────────
         ts_checker.process_packet(pkt, elapsed);
+        if (pkt[0] != TS_SYNC_BYTE)
+        {
+            // Counted as 1.2 (and 1.1 when it repeats); its header is not
+            // trusted by the other analyzers.
+            analyzer.count_unparsed();
+            continue;
+        }
 
         // ── SI monitoring (every packet) ────────────────────────────
         si_monitor.process_packet(pkt, elapsed);
@@ -371,7 +476,7 @@ int main(int argc, char *argv[])
             {
                 si_phase = false;
 
-                if (active_pcr_pids.empty() && !xml_mode)
+                if (active_pcr_pids.empty() && !quiet)
                 {
                     std::cerr << "Warning: no PCR PIDs discovered via SI. "
                             "Scanning all PIDs for PCR fields.\n";
@@ -392,7 +497,7 @@ int main(int argc, char *argv[])
                         for (auto &es : pi.es_list)
                         {
                             referenced_pids.insert(es.pid);
-                            // P1.6 / T-STD apply only to continuous A/V streams.
+                            // 1.6 / T-STD apply only to continuous A/V streams.
                             // Event-driven types (SCTE-35, DSM-CC, private sections)
                             // may be silent for hours and use bursty delivery.
                             if (is_continuous_av_stream_type(es.stream_type)) {
@@ -406,7 +511,7 @@ int main(int argc, char *argv[])
                     }
                 }
 
-                // P1.6: only PIDs from PAT/PMT are expected to be present
+                // 1.6: only PIDs from PAT/PMT are expected to be present
                 ts_checker.register_expected_pids(expected_pids);
 
                 // Fallback: if no ES info but we have PCR PIDs, use legacy per-PID buffer
@@ -416,7 +521,7 @@ int main(int argc, char *argv[])
                         analyzer.init_tstd(p, true);
                 }
 
-                if (!active_pcr_pids.empty() && !xml_mode)
+                if (!active_pcr_pids.empty() && !quiet)
                 {
                     std::cerr << "PCR PIDs discovered:";
                     for (auto p : active_pcr_pids)
@@ -510,7 +615,7 @@ int main(int argc, char *argv[])
         // Tied to elapsed (not packet count) so the % bar advances at the
         // same rate regardless of bitrate, and stays correct even on very
         // low-rate streams where 500k packets would never come up.
-        if (elapsed >= last_progress_s + 1.0 && !xml_mode)
+        if (elapsed >= last_progress_s + 1.0 && !quiet)
         {
             last_progress_s = elapsed;
             double pct = expected_s > 0 ? (elapsed / expected_s) * 100.0 : 0.0;
@@ -534,7 +639,7 @@ int main(int argc, char *argv[])
     }
 
     double actual_duration = started ? (arrival - start_time) : 0;
-    if (!xml_mode)
+    if (!quiet)
         std::cerr << "\r  Captured " << pkt_count << " packets in " << std::fixed
                   << std::setprecision(2) << actual_duration << " s\n\n";
 
@@ -549,6 +654,8 @@ int main(int argc, char *argv[])
                   << "  Possible causes: source not transmitting, wrong address/port,\n"
                   << "  multicast group not joined, firewall, or wrong interface (use\n"
                   << "  iface@addr form, e.g. udp://eth0@239.1.1.1:1234).\n";
+        if (json_mode)
+            JsonReport::print_error(std::cout, 3, "no data received", input->source_name());
         return 3;
     }
     if (actual_duration < ANALYSIS_MIN_DURATION_S)
@@ -558,15 +665,17 @@ int main(int argc, char *argv[])
                   << ANALYSIS_MIN_DURATION_S << " s required for TR 101 290 analysis.\n"
                   << "  T-STD warmup incomplete, PAT/PMT intervals unverifiable.\n"
                   << "  Use a longer recording or increase -t for live streams.\n";
+        if (json_mode)
+            JsonReport::print_error(std::cout, 3, "stream shorter than the 2 s minimum", input->source_name());
         return 3;
     }
-    if (actual_duration < ANALYSIS_P3_DURATION_S && !xml_mode)
+    if (actual_duration < ANALYSIS_P3_DURATION_S && !quiet)
     {
         std::cerr << "Warning: short duration (" << std::fixed << std::setprecision(1)
                   << actual_duration << " s) — P3 interval checks (NIT 10s, EIT schedule 10s, "
                   << "PID absence 5s) may have insufficient data.\n";
     }
-    else if (actual_duration < ANALYSIS_FULL_DURATION_S && !xml_mode)
+    else if (actual_duration < ANALYSIS_FULL_DURATION_S && !quiet)
     {
         std::cerr << "Note: duration " << std::fixed << std::setprecision(1)
                   << actual_duration << " s — TDT interval (30s) may have insufficient data.\n";
@@ -577,28 +686,42 @@ int main(int argc, char *argv[])
     ts_checker.check_pid_absence(actual_duration);
     si_monitor.finalize(actual_duration);
 
-    // Compute unreferenced PIDs (P3.4)
+    // Compute unreferenced PIDs (3.4)
     std::set<uint16_t> unreferenced_pids =
         si_monitor.find_unreferenced_pids(analyzer.pid_bytes(), referenced_pids);
 
     if (analyzer.stats().empty())
     {
         std::cerr << "Error: no PCR data found in the stream.\n";
+        if (json_mode)
+            JsonReport::print_error(std::cout, 2, "no PCR found in the stream", input->source_name());
         return 2;
     }
 
     // ── Report ──────────────────────────────────────────────────────
+    St2022Summary st2022_summary;
+    const St2022Summary *st2022_sp = nullptr;
+    if (st2022_input)
+    {
+        st2022_summary = st2022_input->summary(monotonic_time());
+        st2022_sp = &st2022_summary;
+    }
+
     bool all_pass;
-    if (xml_mode) {
+    if (json_mode) {
+        all_pass = JsonReport::print(std::cout, analyzer, si, ts_checker, si_monitor, pts_analyzer,
+                      iat_analyzer, unreferenced_pids, input->source_name(), actual_duration,
+                      start_utc, st2022_sp);
+    } else if (xml_mode) {
         all_pass = XmlReport::print(std::cout, analyzer, si,
                       ts_checker, si_monitor, pts_analyzer, iat_analyzer,
                       unreferenced_pids,
-                      input->source_name(), actual_duration);
+                      input->source_name(), actual_duration, st2022_sp);
     } else {
         all_pass = Report::print(std::cout, analyzer, si,
                       ts_checker, si_monitor, pts_analyzer, iat_analyzer,
                       unreferenced_pids,
-                      input->source_name(), actual_duration, report_mode);
+                      input->source_name(), actual_duration, report_mode, st2022_sp);
     }
 
     // Exit code: 0 = OVERALL PASS, 65 = OVERALL FAIL.

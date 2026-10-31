@@ -9,6 +9,7 @@ WORKDIR /src
 COPY CMakeLists.txt ./
 COPY include include
 COPY src src
+COPY st2022 st2022
 RUN cmake -S . -B /build -DCMAKE_BUILD_TYPE=Release -DTS_ANALYZE_STATIC=ON \
  && cmake --build /build -j4
 

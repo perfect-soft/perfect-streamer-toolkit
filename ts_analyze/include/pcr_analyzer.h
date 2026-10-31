@@ -35,6 +35,7 @@
  * avoiding burst-induced artifacts from UDP arrival timestamps.
  */
 
+#include "events.h"
 #include "ts_common.h"
 #include "tr101290_defs.h"
 
@@ -55,11 +56,11 @@ struct PcrPidStats {
     // Counters
     int64_t  pcr_count         = 0;
     int64_t  total_packets     = 0;    // packets on this PID
-    int64_t  pcr_interval_err      = 0;  // intervals > pcr_interval_limit_ (TR 101 290, default 40 ms)
+    int64_t  pcr_interval_err      = 0;  // intervals > 40 ms (TR 101 290 2.3a)
     int64_t  pcr_interval_hard_err = 0;  // intervals > 100 ms (ISO 13818-1 hard limit, gates OVERALL)
     int64_t  pcr_interval_warn     = 0;  // intervals > 25 ms (recommended)
     int64_t  pcr_accuracy_err  = 0;    // |jitter| > 500 ns
-    int64_t  pcr_discont_ind_errors = 0; // P2.4: gap > 100 ms without discontinuity flag
+    int64_t  pcr_discont_ind_errors = 0; // 2.3b: gap > 100 ms without discontinuity flag
     int64_t  discontinuities   = 0;
 
     // PCR interval statistics (seconds)
@@ -68,7 +69,7 @@ struct PcrPidStats {
     double   interval_sum  = 0;
     int64_t  interval_count = 0;
 
-    // Previous valid pcr_delta — used for P1.4 burst-pair tolerance
+    // Previous valid pcr_delta — used for 1.4 burst-pair tolerance
     double   prev_pcr_delta = 0;
 
     // PCR accuracy / jitter (seconds)
@@ -222,7 +223,10 @@ struct TstdEsBuffer {
         drain_to(stream_t);
         level += bytes;
 
-        if (level > capacity) overflows++;
+        if (level > capacity) {
+            overflows++;
+            Events::get().note("TSTD.over", es_pid);
+        }
         if (level > max_level) max_level = level;
     }
 
@@ -232,7 +236,10 @@ struct TstdEsBuffer {
         if (dt > 0 && drain_rate > 0) {
             level -= drain_rate * dt;
             if (level < 0) {
-                if (measuring) underflows++;
+                if (measuring) {
+                    underflows++;
+                    Events::get().note("TSTD.under", es_pid);
+                }
                 level = 0;
             }
         }
@@ -272,7 +279,6 @@ public:
     void set_file_mode(bool fm) { file_mode_ = fm; }
     bool file_mode() const { return file_mode_; }
 
-    void set_pcr_interval_limit(double limit_s) { pcr_interval_limit_ = limit_s; }
     double pcr_interval_limit() const { return pcr_interval_limit_; }
 
     // Process a TS packet with its arrival time
@@ -328,7 +334,7 @@ public:
                 if (pcr_delta > st.interval_max) st.interval_max = pcr_delta;
                 st.interval_samples.push_back(pcr_delta);
 
-                // TR 101 290 — 1.4 (with RAP burst-pair tolerance).
+                // TR 101 290 2.3a (with RAP burst-pair tolerance).
                 // Encoders legitimately insert an extra PCR right after a
                 // normal one to mark a random-access point (I-frame), then
                 // skip the next scheduled slot. This produces a {short,
@@ -348,18 +354,24 @@ public:
                 {
                     exceeds = false;   // RAP burst-pair, not a true gap
                 }
-                if (exceeds)
+                if (exceeds) {
                     st.pcr_interval_err++;
+                    if (Events::on())
+                        Events::get().note("2.3a", h.pid, "PCR interval " + std::to_string((int) (pcr_delta * 1e3)) + " ms");
+                }
                 if (pcr_delta > ISO13818_PCR_HARD_MAX_S)
                     st.pcr_interval_hard_err++;
                 st.prev_pcr_delta = pcr_delta;
                 if (pcr_delta > TR101290_PCR_INTERVAL_REC_S)
                     st.pcr_interval_warn++;
 
-                // TR 101 290 P2.4 — PCR discontinuity indicator error
+                // TR 101 290 2.3b — PCR discontinuity indicator error
                 // Gap > 100 ms without discontinuity_indicator set
-                if (pcr_delta > 0.100 && !pcr.discontinuity)
+                if (pcr_delta > 0.100 && !pcr.discontinuity) {
                     st.pcr_discont_ind_errors++;
+                    if (Events::on())
+                        Events::get().note("2.3b", h.pid, "PCR step " + std::to_string((int) (pcr_delta * 1e3)) + " ms without the discontinuity flag");
+                }
 
                 // ── Bitrate estimation from PCR ─────────────────────
                 int64_t bytes_between = st.bytes_since_pcr + TS_PACKET_SIZE;
@@ -407,9 +419,12 @@ public:
                         if (offset > st.accuracy_max) st.accuracy_max = offset;
                         st.accuracy_samples.push_back(offset);
 
-                        // TR 101 290 — 2.3
-                        if (std::abs(offset) > TR101290_PCR_ACCURACY_S)
+                        // TR 101 290 2.4 PCR_accuracy_error
+                        if (std::abs(offset) > TR101290_PCR_ACCURACY_S) {
                             st.pcr_accuracy_err++;
+                            if (Events::on())
+                                Events::get().note("2.4", h.pid, "offset " + std::to_string((int) (offset * 1e9)) + " ns");
+                        }
 
                         // Update T-STD pkt duration from regression slope
                         if (slope > 0)
@@ -500,6 +515,9 @@ public:
     int64_t null_packets()  const { return null_packets_; }
 
     // Count a packet without PCR analysis (for global stats)
+    // A packet with a bad sync byte: it holds its byte position, nothing else.
+    void count_unparsed() { total_packets_++; }
+
     void count_packet(const uint8_t* pkt) {
         total_packets_++;
         TsHeader h = parse_ts_header(pkt);
@@ -557,7 +575,7 @@ private:
     int64_t total_packets_ = 0;
     int64_t null_packets_  = 0;
     bool    file_mode_     = false;
-    double  pcr_interval_limit_ = TR101290_PCR_INTERVAL_MAX_S;  // default 40 ms
+    double  pcr_interval_limit_ = TR101290_PCR_INTERVAL_MAX_S;  // 40 ms
 
     // ── T-STD stream timing ─────────────────────────────────────────
     double  tstd_pkt_dur_ = 0;   // seconds per TS packet (from PCR regression)

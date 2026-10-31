@@ -31,7 +31,7 @@ static constexpr double TR101290_PMT_INTERVAL_MAX_S   = 0.500;   // 500 ms
 static constexpr double TR101290_PID_ABSENCE_MAX_S    = 5.0;     // 5 s
 
 // ISO/IEC 13818-1 §2.4.2.2 — hard upper bound on PCR repetition.
-// TR 101 290 P1.4 default of 40 ms is a stricter recommendation; an
+// TR 101 290 1.4 default of 40 ms is a stricter recommendation; an
 // occasional encoder slot-skip can put a single interval between 40 ms
 // and this hard limit without breaking decoder clock recovery, so we
 // reserve the OVERALL fail for genuine ISO violations.
@@ -134,7 +134,7 @@ inline uint16_t psi_table_id_extension(const uint8_t* section) {
 }
 
 // True for ES stream types that deliver continuous A/V data, suitable for:
-//   - P1.6 PID absence check (must appear within 5 s)
+//   - 1.6 PID absence check (must appear within 5 s)
 //   - T-STD buffer model (constant-drain assumption holds)
 // Excluded:
 //   0x05         private sections / KLV / event triggers

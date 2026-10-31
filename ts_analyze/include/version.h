@@ -10,7 +10,7 @@
  * and report headers pick it up automatically.
  */
 
-#define TS_ANALYZE_VERSION "2.5"
+#define TS_ANALYZE_VERSION "2.6"
 
 inline const char *ts_analyze_version()
 {

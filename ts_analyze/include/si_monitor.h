@@ -7,22 +7,22 @@
  * si_monitor.h — TR 101 290 SI table interval and CRC monitoring
  *
  * Implements:
- *   P1.3   PAT error           — no PAT within 500 ms; CRC error
- *   P1.3a  PAT error 2         — version change without tsid change
- *   P1.5   PMT error           — no PMT within 500 ms; CRC error
- *   P1.5a  PMT error 2         — version change without program_number change
- *   P2.2   CRC error           — CRC error in any PSI/SI section
- *   P2.7   CAT error           — no CAT within 500 ms when scrambling detected
- *   P3.1   NIT actual error    — NIT_actual absent or interval > 10 s
- *   P3.2   NIT other error     — NIT_other interval > 10 s
- *   P3.4   Unreferenced PID    — PID present but not referenced by SI
- *   P3.5   SDT actual error    — SDT_actual absent or interval > 2 s
- *   P3.6   SDT other error     — SDT_other interval > 2 s
- *   P3.7   EIT actual p/f      — absent or interval > 2 s
- *   P3.8   EIT other p/f       — interval > 20 s (EN 300 468 Annex C)
- *   P3.9   EIT actual schedule — interval > 10 s per sub-table
- *   P3.10  EIT other schedule  — interval > 10 s per sub-table
- *   P3.12  TDT error           — absent or interval > 30 s
+ *   TR 101 290:
+ *   1.3          PAT error           — no valid PAT within 500 ms
+ *   1.5          PMT error           — no valid PMT within 500 ms
+ *   2.2          CRC error           — CRC error in any PSI/SI section
+ *   2.6          CAT error           — no CAT within 500 ms when scrambling detected
+ *   3.1a / 3.1b  NIT actual / other  — absent or interval > 10 s
+ *   3.4          Unreferenced PID    — PID present but not referenced by SI
+ *   3.5a / 3.5b  SDT actual / other  — absent or interval > 2 s
+ *   3.6a         EIT actual p/f      — absent or interval > 2 s
+ *   3.6b         EIT other p/f       — interval > 20 s (EN 300 468 Annex C)
+ *   3.8          TDT error           — absent or interval > 30 s
+ *   Not in TR 101 290:
+ *   PAT.version  version change without a tsid change
+ *   PMT.version  version change without a program_number change
+ *   EIT.sch_act / EIT.sch_oth  EIT schedule sub-table interval > 10 s
+ *   SI.size, SI.eit1024        section sizes (ISO/EN limit; EIT > 1024 B)
  *
  * EIT schedule is tracked per sub-table (table_id 0x50–0x5F, 0x60–0x6F)
  * as required by EN 300 468 Annex C.
@@ -30,6 +30,7 @@
  * Uses raw PSI section assembly (no extra libdvbpsi headers beyond PAT/PMT).
  */
 
+#include "events.h"
 #include "ts_common.h"
 #include "tr101290_defs.h"
 
@@ -52,12 +53,12 @@ struct SiTableStats {
     int64_t      interval_violations = 0;
     bool         seen_at_least_once   = false;
 
-    // Version consistency (P1.3a / P1.5a)
+    // Version consistency (PAT.version / PMT.version)
     uint8_t      last_version     = 0xFF;
     uint16_t     last_context_id  = 0xFFFF;
     int64_t      version_errors   = 0;
 
-    // CRC errors (P2.2)
+    // CRC errors (2.2)
     int64_t      crc_errors       = 0;
 
     // Section size tracking
@@ -125,19 +126,19 @@ public:
         assemblers_[TS_PID_TDT];
     }
 
-    // Disable NIT analysis (P3.1, P3.2 + NIT contributions to P2.2 / section size).
+    // Disable NIT analysis (3.1a, 3.1b + NIT contributions to 2.2 / section size).
     // Must be called before process_packet(): erasing the assembler entry causes
     // process_packet() to skip every TS packet on PID 0x0010 (TS_PID_NIT), so no
     // NIT section is ever assembled and no NIT stats accumulate. The disabled
     // flag also suppresses the "absent" verdict in finalize() — without it the
-    // missing NIT_actual would be flagged as a P3.1 interval violation by
+    // missing NIT_actual would be flagged as a 3.1a interval violation by
     // flag_missing() once total_duration exceeds the 10 s limit.
     void disable_nit() {
         nit_disabled_ = true;
         assemblers_.erase(TS_PID_NIT);
     }
 
-    // Disable EIT analysis (P3.7..P3.10 + EIT contributions to P2.2, section
+    // Disable EIT analysis (3.6a, 3.6b, EIT.sch_act, EIT.sch_oth + EIT contributions to 2.2, section
     // size, STB-compat warnings). Same mechanism as disable_nit().
     void disable_eit() {
         eit_disabled_ = true;
@@ -164,7 +165,7 @@ public:
 
         TsHeader h = parse_ts_header(pkt);
 
-        // Track scrambling for CAT check (P2.7)
+        // Track scrambling for CAT check (2.6)
         if (h.scrambling != 0)
             scrambling_detected_ = true;
 
@@ -248,7 +249,7 @@ public:
     const std::map<uint8_t, SiTableStats>& eit_actual_sch_sub() const { return eit_actual_sch_sub_; }
     const std::map<uint8_t, SiTableStats>& eit_other_sch_sub()  const { return eit_other_sch_sub_; }
 
-    // Aggregated EIT schedule stats (P3.9 / P3.10)
+    // Aggregated EIT schedule stats (EIT.sch_act / EIT.sch_oth)
     EitScheduleAggregated eit_actual_sch_aggregated() const {
         return aggregate_eit_sch(eit_actual_sch_sub_);
     }
@@ -258,7 +259,7 @@ public:
 
     bool scrambling_detected() const { return scrambling_detected_; }
 
-    // Total CRC errors across all monitored tables (P2.2)
+    // Total CRC errors across all monitored tables (2.2)
     int64_t total_crc_errors() const {
         int64_t n = pat_.crc_errors + cat_.crc_errors
                   + nit_actual_.crc_errors + nit_other_.crc_errors
@@ -303,7 +304,7 @@ public:
         return m;
     }
 
-    // Unreferenced PIDs (P3.4)
+    // Unreferenced PIDs (3.4)
     std::set<uint16_t> find_unreferenced_pids(
         const std::map<uint16_t, int64_t>& all_pid_bytes,
         const std::set<uint16_t>& referenced_pids) const
@@ -447,17 +448,25 @@ private:
         // Section size tracking
         if (len > st.section_max_bytes)
             st.section_max_bytes = len;
-        if (st.section_std_limit > 0 && len > st.section_std_limit)
+        if (st.section_std_limit > 0 && len > st.section_std_limit) {
             st.section_size_errors++;
+            if (Events::on())
+                Events::get().note("SI.size", st.pid, st.name + " section " + std::to_string(len) + " B > "
+                                   + std::to_string(st.section_std_limit) + " B");
+        }
         if (st.section_std_limit == EIT_SECTION_MAX_BYTES
             && len > EIT_SECTION_STB_COMPAT_BYTES
-            && len <= EIT_SECTION_MAX_BYTES)
+            && len <= EIT_SECTION_MAX_BYTES) {
             st.section_size_warnings++;
+            if (Events::on())
+                Events::get().note("SI.eit1024", st.pid, st.name + " section " + std::to_string(len) + " B");
+        }
 
-        // CRC check (P2.2)
+        // CRC check (2.2)
         if (has_crc) {
             if (!check_psi_crc(section, static_cast<size_t>(len))) {
                 st.crc_errors++;
+                Events::get().note("2.2", st.pid, st.name);
                 return;
             }
         }
@@ -468,19 +477,29 @@ private:
             if (interval > st.max_interval)
                 st.max_interval = interval;
             st.interval_count++;
-            if (st.interval_limit_s > 0 && interval > st.interval_limit_s)
+            if (st.interval_limit_s > 0 && interval > st.interval_limit_s) {
                 st.interval_violations++;
+                if (Events::on() && si_interval_check(st.name))
+                    Events::get().note(si_interval_check(st.name), st.pid,
+                                       st.name + " interval " + std::to_string((int) (interval * 1e3))
+                                       + " ms > " + std::to_string((int) (st.interval_limit_s * 1e3)) + " ms");
+            }
         }
         st.last_seen          = t;
         st.seen_at_least_once = true;
 
-        // Version check (P1.3a, P1.5a)
+        // Version check (PAT.version, PMT.version)
         if (has_crc && len >= 6) {
             uint8_t  version    = psi_section_version(section);
             uint16_t context_id = psi_table_id_extension(section);
             if (st.last_version != 0xFF) {
-                if (version != st.last_version && context_id == st.last_context_id)
+                if (version != st.last_version && context_id == st.last_context_id) {
                     st.version_errors++;
+                    if (Events::on() && si_version_check(st.name))
+                        Events::get().note(si_version_check(st.name), st.pid,
+                                           st.name + " version " + std::to_string(st.last_version) + " -> "
+                                           + std::to_string(version));
+                }
             }
             st.last_version    = version;
             st.last_context_id = context_id;
@@ -489,8 +508,11 @@ private:
 
     void flag_missing(SiTableStats& st, double total_duration_s) {
         if (!st.seen_at_least_once && st.interval_limit_s > 0) {
-            if (total_duration_s > st.interval_limit_s)
+            if (total_duration_s > st.interval_limit_s) {
                 st.interval_violations++;
+                if (Events::on() && si_interval_check(st.name))
+                    Events::get().note(si_interval_check(st.name), st.pid, st.name + " never seen", 0);
+            }
         }
     }
 

@@ -23,6 +23,7 @@
 #include "iat_analyzer.h"
 #include "tr101290_defs.h"
 #include "verdict.h"
+#include "st2022_report.h"
 #include "version.h"
 
 #include <iostream>
@@ -46,14 +47,15 @@ public:
             const IatAnalyzer &iat_analyzer,
             const std::set<uint16_t> &unreferenced_pids,
             const std::string &source,
-            double duration_s)
+            double duration_s,
+            const St2022Summary *st2022 = nullptr)
     {
         const auto &stats = analyzer.stats();
         const auto &programs = si.programs();
         const auto &ts_stats = ts_checker.stats();
         bool is_file = analyzer.file_mode();
         const bool all_pass = Verdict::overall(analyzer, ts_checker, si_monitor,
-                                               pts_analyzer, duration_s);
+                                               pts_analyzer, duration_s, st2022);
 
         char time_buf[32];
         std::time_t now = std::time(nullptr);
@@ -93,30 +95,30 @@ public:
         // ── TR 101 290 checks ──────────────────────────────────────────
         out << "  <tr101290>\n";
 
-        emit_check(out, "1.1",  "TS Sync Byte Error",
-                   ts_stats.sync_byte_errors, true);
-        emit_check(out, "1.2",  "Sync Byte Error (sync loss)",
+        emit_check(out, "1.1",  "TS Sync Loss",
                    ts_stats.sync_loss_events, true);
+        emit_check(out, "1.2",  "Sync Byte Error",
+                   ts_stats.sync_byte_errors, true);
         {
             auto& ps = si_monitor.pat_stats();
             emit_check(out, "1.3",  "PAT Error",
-                       ps.interval_violations + ps.crc_errors, true);
+                       ps.interval_violations, true);
         }
-        emit_check(out, "1.3a", "PAT Error 2 (version)",
+        emit_check(out, "PAT.version", "PAT version change",
                    si_monitor.pat_stats().version_errors, true);
         emit_check(out, "1.4",  "Continuity Count Error",
                    ts_stats.cc_errors, true);
         {
             int64_t pmt_err = 0;
             for (auto& [pid, st] : si_monitor.pmt_stats())
-                pmt_err += st.interval_violations + st.crc_errors;
+                pmt_err += st.interval_violations;
             emit_check(out, "1.5",  "PMT Error", pmt_err, true);
         }
         {
             int64_t pmt_ver_err = 0;
             for (auto& [pid, st] : si_monitor.pmt_stats())
                 pmt_ver_err += st.version_errors;
-            emit_check(out, "1.5a", "PMT Error 2 (version)", pmt_ver_err, true);
+            emit_check(out, "PMT.version", "PMT version change", pmt_ver_err, true);
         }
         emit_check(out, "1.6",  "PID Error (5s absence)",
                    ts_stats.pid_absence_errors, true);
@@ -124,81 +126,83 @@ public:
         emit_check(out, "2.1",  "Transport Error", ts_stats.transport_errors, true);
         emit_check(out, "2.2",  "CRC Error", si_monitor.total_crc_errors(), true);
 
-        // P2.3: hard counter (>100ms ISO) gates OVERALL; soft (>40ms TR) is info.
+        // 2.3a: intervals above 40 ms (TR 101 290) are the
+        // errors; the ISO 100 ms count is an attribute.
         {
-            int64_t hard = 0, soft = 0;
+            int64_t err = 0, iso = 0;
             for (auto& [pid, st] : stats) {
-                hard += st.pcr_interval_hard_err;
-                soft += st.pcr_interval_err;
+                err += st.pcr_interval_err;
+                iso += st.pcr_interval_hard_err;
             }
-            emit_check(out, "2.3", "PCR Repetition Error", hard, true,
-                       std::string(" soft_violations=\"") + std::to_string(soft) + "\"");
+            emit_check(out, "2.3a", "PCR Repetition Error", err, true,
+                       " limit_ms=\"" + fmt(analyzer.pcr_interval_limit() * 1e3, 0)
+                       + "\" iso_violations=\"" + std::to_string(iso) + "\"");
         }
 
         {
             int64_t pcr_disc_err = 0;
             for (auto& [pid, st] : stats) pcr_disc_err += st.pcr_discont_ind_errors;
-            emit_check(out, "2.4", "PCR Discontinuity Indicator Error",
+            emit_check(out, "2.3b", "PCR Discontinuity Indicator Error",
                        pcr_disc_err, true);
         }
         {
             int64_t pcr_acc_err = 0;
             for (auto& [pid, st] : stats) pcr_acc_err += st.pcr_accuracy_err;
-            emit_check(out, "2.5", "PCR Accuracy Error",
+            emit_check(out, "2.4", "PCR Accuracy Error",
                        pcr_acc_err, !is_file);
         }
-        emit_check(out, "2.6", "PTS Error", pts_analyzer.total_pts_errors(), true);
+        emit_check(out, "2.5", "PTS Error", pts_analyzer.total_pts_errors(), true);
         {
             auto& cs = si_monitor.cat_stats();
-            int64_t cat_err = cs.interval_violations + cs.crc_errors;
-            emit_check(out, "2.7", "CAT Error", cat_err,
+            int64_t cat_err = cs.interval_violations;
+            emit_check(out, "2.6", "CAT Error", cat_err,
                        si_monitor.scrambling_detected());
         }
 
         {
             auto& ns = si_monitor.nit_actual_stats();
-            emit_check(out, "3.1", "NIT Actual Error",
-                       ns.interval_violations + ns.crc_errors,
+            emit_check(out, "3.1a", "NIT Actual Error",
+                       ns.interval_violations,
                        !si_monitor.nit_is_disabled());
         }
         {
             auto& ns = si_monitor.nit_other_stats();
-            emit_check(out, "3.2", "NIT Other Error",
-                       ns.interval_violations + ns.crc_errors,
+            emit_check(out, "3.1b", "NIT Other Error",
+                       ns.interval_violations,
                        ns.seen_at_least_once && !si_monitor.nit_is_disabled());
         }
         emit_info(out, "3.4", "Unreferenced PIDs",
                   static_cast<int64_t>(unreferenced_pids.size()));
         {
             auto& ss = si_monitor.sdt_actual_stats();
-            emit_check(out, "3.5", "SDT Actual Error",
-                       ss.interval_violations + ss.crc_errors, true);
+            emit_check(out, "3.5a", "SDT Actual Error",
+                       ss.interval_violations, true);
         }
         {
             auto& ss = si_monitor.sdt_other_stats();
-            emit_check(out, "3.6", "SDT Other Error",
-                       ss.interval_violations + ss.crc_errors,
+            emit_check(out, "3.5b", "SDT Other Error",
+                       ss.interval_violations,
                        ss.seen_at_least_once);
         }
         {
             auto& es = si_monitor.eit_actual_pf_stats();
-            emit_check(out, "3.7", "EIT Actual P/F",
-                       es.interval_violations + es.crc_errors,
+            emit_check(out, "3.6a", "EIT Actual P/F",
+                       es.interval_violations,
                        !si_monitor.eit_is_disabled());
         }
-        emit_check(out, "3.12", "TDT Error",
+        emit_check(out, "3.8", "TDT Error",
                    si_monitor.tdt_stats().interval_violations, true);
 
         {
             int64_t tstd_uf = 0;
             for (auto& [pid, st] : stats) tstd_uf += st.tstd_underflows;
-            emit_check(out, "3.13", "Empty Buffer Error (T-STD)",
+            emit_check(out, "TSTD.under", "T-STD buffer underflow",
                        tstd_uf, !is_file);
         }
         {
             int64_t tstd_of = 0;
             for (auto& [pid, st] : stats) tstd_of += st.tstd_overflows;
-            emit_check(out, "3.14", "Data Delay Error (T-STD)",
+            emit_check(out, "TSTD.over", "T-STD buffer overflow",
                        tstd_of, !is_file);
         }
 
@@ -261,7 +265,7 @@ public:
 
             // Interval
             if (st.interval_count > 0) {
-                bool intv_ok = (st.pcr_interval_hard_err == 0);
+                bool intv_ok = (st.pcr_interval_err == 0);
                 out << "      <interval samples=\""    << st.interval_count
                     << "\" min_ms=\""                  << fmt(st.interval_min * 1e3, 3)
                     << "\" max_ms=\""                  << fmt(st.interval_max * 1e3, 3)
@@ -341,11 +345,14 @@ public:
         }
         out << "  </pcr_pids>\n";
 
-        // ── Unreferenced PIDs (P3.4 detail) ────────────────────────────
+        // ── Unreferenced PIDs (3.4 detail) ────────────────────────────
         out << "  <unreferenced_pids count=\"" << unreferenced_pids.size() << "\">\n";
         for (auto p : unreferenced_pids)
             out << "    <pid value=\"" << pid_hex(p) << "\"/>\n";
         out << "  </unreferenced_pids>\n";
+
+        if (st2022 && st2022->enabled)
+            St2022Report::xml(out, *st2022);
 
         // ── Overall ────────────────────────────────────────────────────
         out << "  <overall result=\"" << pf(all_pass) << "\"/>\n";

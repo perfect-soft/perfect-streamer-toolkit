@@ -7,13 +7,14 @@
  * pts_analyzer.h — TR 101 290 PTS interval checks
  *
  * Implements:
- *   P2.6   PTS error          — PTS repetition interval > 700 ms
- *   P3.13  Empty buffer error — no PES payload data (informational)
+ *   2.5   PTS error          — PTS repetition interval > 700 ms
+ *   TSTD.under  Empty buffer error — no PES payload data (informational)
  *
  * PTS is extracted from PES headers on elementary stream PIDs.
  * PTS values are 33-bit, 90 kHz clock.
  */
 
+#include "events.h"
 #include "ts_common.h"
 #include "tr101290_defs.h"
 
@@ -44,7 +45,7 @@ struct PtsPidStats {
     bool     is_video     = false;
 
     int64_t  pts_count            = 0;
-    int64_t  pts_interval_errors  = 0;   // P2.6: interval > 700 ms
+    int64_t  pts_interval_errors  = 0;   // 2.5: interval > 700 ms
     double   pts_max_interval_s   = 0;
     double   pts_sum_interval_s   = 0;
 
@@ -135,9 +136,12 @@ public:
                     st.pts_max_interval_s = interval;
                 st.pts_sum_interval_s += interval;
 
-                // P2.6: PTS interval > 700 ms
-                if (interval > TR101290_PTS_INTERVAL_MAX_S)
+                // 2.5: PTS interval > 700 ms
+                if (interval > TR101290_PTS_INTERVAL_MAX_S) {
                     st.pts_interval_errors++;
+                    if (Events::on())
+                        Events::get().note("2.5", h.pid, "PTS interval " + std::to_string((int) (interval * 1e3)) + " ms");
+                }
             }
         }
 
@@ -146,7 +150,7 @@ public:
 
     const std::map<uint16_t, PtsPidStats>& stats() const { return stats_; }
 
-    // Total P2.6 violations across all ES
+    // Total 2.5 violations across all ES
     int64_t total_pts_errors() const {
         int64_t n = 0;
         for (auto& [pid, st] : stats_)

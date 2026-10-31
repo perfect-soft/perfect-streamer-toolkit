@@ -32,9 +32,9 @@ static constexpr int64_t PCR_EXT_DIVISOR = 300LL;            // base*300+ext
 static constexpr int64_t PCR_MAX = (1LL << 33) * 300 + 299; // max 42-bit value
 
 // ─── TR 101 290 limits ──────────────────────────────────────────────
-static constexpr double TR101290_PCR_INTERVAL_MAX_S = 0.040;      // 40 ms  (Priority 1)
+static constexpr double TR101290_PCR_INTERVAL_MAX_S = 0.040;      // 40 ms  (2.3a)
 static constexpr double TR101290_PCR_INTERVAL_REC_S = 0.025;      // 25 ms  (recommended)
-static constexpr double TR101290_PCR_ACCURACY_NS = 500.0;      // ±500 ns (Priority 2)
+static constexpr double TR101290_PCR_ACCURACY_NS = 500.0;      // ±500 ns (2.4)
 static constexpr double TR101290_PCR_ACCURACY_S = 500.0e-9;
 
 // ─── T-STD transport buffer sizes (ISO 13818-1 Table 2-36) ──────────

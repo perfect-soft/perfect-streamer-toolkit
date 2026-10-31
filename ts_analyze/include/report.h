@@ -18,6 +18,7 @@
 #include "pts_analyzer.h"
 #include "iat_analyzer.h"
 #include "verdict.h"
+#include "st2022_report.h"
 #include "version.h"
 
 #include <iostream>
@@ -48,7 +49,8 @@ public:
             const std::set<uint16_t> &unreferenced_pids,
             const std::string &source,
             double duration_s,
-            Mode mode)
+            Mode mode,
+            const St2022Summary *st2022 = nullptr)
     {
         auto now = std::time(nullptr);
         // localtime_r writes into a caller-supplied tm — std::localtime
@@ -63,14 +65,14 @@ public:
         std::strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S %Z", &tm_buf);
 
         const bool all_pass = Verdict::overall(analyzer, ts_checker, si_monitor,
-                                               pts_analyzer, duration_s);
+                                               pts_analyzer, duration_s, st2022);
 
         if (mode == FULL)
             print_full(out, analyzer, si, ts_checker, si_monitor, pts_analyzer, iat_analyzer,
-                       unreferenced_pids, source, duration_s, time_buf, all_pass);
+                       unreferenced_pids, source, duration_s, time_buf, all_pass, st2022);
         else
             print_short(out, analyzer, si, ts_checker, si_monitor, pts_analyzer, iat_analyzer,
-                        unreferenced_pids, source, duration_s, time_buf, all_pass);
+                        unreferenced_pids, source, duration_s, time_buf, all_pass, st2022);
         return all_pass;
     }
 
@@ -107,7 +109,7 @@ private:
         const char *verdict_color = !applicable ? nullptr
                                                 : (ok ? Color::GREEN : Color::RED);
 
-        out << "  |  " << std::left << std::setw(6) << id
+        out << "  |  " << std::left << std::setw(12) << id
             << std::setw(30) << name << ": ";
         if (!applicable)
             out << std::setw(17) << "N/A";
@@ -123,7 +125,7 @@ private:
     static void check_line_info(std::ostream &out, const char* id, const char* name,
                                 int64_t count, const std::string &detail = "")
     {
-        out << "  |  " << std::left << std::setw(6) << id
+        out << "  |  " << std::left << std::setw(12) << id
             << std::setw(30) << name << ": "
             << std::right << std::setw(8) << count
             << "         INFO";
@@ -135,7 +137,7 @@ private:
     static void check_line_warn(std::ostream &out, const char* id, const char* name,
                                 int64_t count, const std::string &detail = "")
     {
-        out << "  |  " << std::left << std::setw(6) << id
+        out << "  |  " << std::left << std::setw(12) << id
             << std::setw(30) << name << ": "
             << std::right << std::setw(8) << count
             << "         " << Color::wrap(Color::YELLOW, "WARN");
@@ -175,7 +177,8 @@ private:
             const std::string &source,
             double duration_s,
             const char *time_str,
-            bool all_pass)
+            bool all_pass,
+            const St2022Summary *st2022)
     {
         const auto &stats = analyzer.stats();
         const auto &programs = si.programs();
@@ -231,27 +234,27 @@ private:
         out << "  TR 101 290 — PRIORITY 1 (TS decodability)\n";
         separator(out);
 
-        // P1.1 TS sync byte error
-        check_line(out, "1.1", "TS Sync Byte",
-                   ts_stats.sync_byte_errors, true);
-
-        // P1.2 Sync byte error (sync loss)
-        check_line(out, "1.2", "Sync Byte (sync loss)",
+        // 1.1 TS_sync_loss: 2+ consecutive packets with a bad sync byte
+        check_line(out, "1.1", "TS Sync Loss",
                    ts_stats.sync_loss_events, true);
 
-        // P1.3 PAT error
+        // 1.2 Sync_byte_error: a sync byte other than 0x47
+        check_line(out, "1.2", "Sync Byte Error",
+                   ts_stats.sync_byte_errors, true);
+
+        // 1.3 PAT error
         {
             auto& ps = si_monitor.pat_stats();
-            int64_t pat_err = ps.interval_violations + ps.crc_errors;
+            int64_t pat_err = ps.interval_violations;
             check_line(out, "1.3", "PAT",
                        pat_err, true);
         }
 
-        // P1.3a PAT error 2 (version)
-        check_line(out, "1.3a", "PAT Version",
+        // PAT.version PAT error 2 (version)
+        check_line(out, "PAT.version", "PAT version change",
                    si_monitor.pat_stats().version_errors, true);
 
-        // P1.4 Continuity Count Error
+        // 1.4 Continuity Count Error
         {
             std::string cc_detail;
             if (ts_stats.cc_errors > 0) {
@@ -266,25 +269,25 @@ private:
                        ts_stats.cc_errors, true, cc_detail);
         }
 
-        // P1.5 PMT error
+        // 1.5 PMT error
         {
             int64_t pmt_err = 0;
             for (auto& [pid, st] : si_monitor.pmt_stats())
-                pmt_err += st.interval_violations + st.crc_errors;
+                pmt_err += st.interval_violations;
             check_line(out, "1.5", "PMT",
                        pmt_err, true);
         }
 
-        // P1.5a PMT error 2 (version)
+        // PMT.version PMT error 2 (version)
         {
             int64_t pmt_ver_err = 0;
             for (auto& [pid, st] : si_monitor.pmt_stats())
                 pmt_ver_err += st.version_errors;
-            check_line(out, "1.5a", "PMT Version",
+            check_line(out, "PMT.version", "PMT version change",
                        pmt_ver_err, true);
         }
 
-        // P1.6 PID error
+        // 1.6 PID error
         {
             std::string pid_detail;
             if (!ts_stats.pid_absent_set.empty()) {
@@ -304,7 +307,7 @@ private:
         out << "  TR 101 290 — PRIORITY 2 (recommended monitoring)\n";
         separator(out);
 
-        // P2.1 Transport error indicator
+        // 2.1 Transport error indicator
         {
             std::string tei_detail;
             if (ts_stats.transport_errors > 0) {
@@ -319,56 +322,56 @@ private:
                        ts_stats.transport_errors, true, tei_detail);
         }
 
-        // P2.2 CRC error
+        // 2.2 CRC error
         check_line(out, "2.2", "CRC",
                    si_monitor.total_crc_errors(), true);
 
-        // P2.3 PCR repetition error.
-        // OVERALL gate uses the ISO 13818-1 §2.4.2.2 hard limit (100 ms).
-        // The TR 101 290 P2.3 recommendation (default 40 ms) is reported
-        // separately in the per-PCR-PID detail and as a soft warning here.
+        // 2.3a PCR_repetition_error: an interval above 40 ms (TR 101 290);
+        // the ISO 13818-1 100 ms count is an informational detail.
         {
-            int64_t pcr_hard_err = 0;
-            int64_t pcr_soft_err = 0;
+            int64_t pcr_err = 0;
+            int64_t pcr_iso = 0;
             for (auto& [pid, st] : stats) {
-                pcr_hard_err += st.pcr_interval_hard_err;
-                pcr_soft_err += st.pcr_interval_err;
+                pcr_err += st.pcr_interval_err;
+                pcr_iso += st.pcr_interval_hard_err;
             }
-            check_line(out, "2.3", "PCR Repetition",
-                       pcr_hard_err, true);
-            if (pcr_hard_err == 0 && pcr_soft_err > 0)
-                check_line_warn(out, "2.3a", "PCR Repetition (>40ms)",
-                                pcr_soft_err, "within ISO 100 ms hard limit");
+            std::ostringstream lim;
+            lim << "> " << std::fixed << std::setprecision(0)
+                << analyzer.pcr_interval_limit() * 1e3 << " ms";
+            if (pcr_iso)
+                lim << ", " << pcr_iso << " > 100 ms (ISO)";
+            check_line(out, "2.3a", "PCR Repetition",
+                       pcr_err, true, lim.str());
         }
 
-        // P2.4 PCR discontinuity indicator error
+        // 2.3b PCR discontinuity indicator error
         {
             int64_t pcr_disc_err = 0;
             for (auto& [pid, st] : stats)
                 pcr_disc_err += st.pcr_discont_ind_errors;
-            check_line(out, "2.4", "PCR Discont. Indicator",
+            check_line(out, "2.3b", "PCR Discont. Indicator",
                        pcr_disc_err, true);
         }
 
-        // P2.5 PCR accuracy error
+        // 2.4 PCR accuracy error
         {
             int64_t pcr_acc_err = 0;
             for (auto& [pid, st] : stats)
                 pcr_acc_err += st.pcr_accuracy_err;
-            check_line(out, "2.5", "PCR Accuracy",
+            check_line(out, "2.4", "PCR Accuracy",
                        pcr_acc_err, !is_file);
         }
 
-        // P2.6 PTS error
-        check_line(out, "2.6", "PTS Interval",
+        // 2.5 PTS error
+        check_line(out, "2.5", "PTS Interval",
                    pts_analyzer.total_pts_errors(), true);
 
-        // P2.7 CAT error
+        // 2.6 CAT error
         {
             auto& cs = si_monitor.cat_stats();
-            int64_t cat_err = cs.interval_violations + cs.crc_errors;
+            int64_t cat_err = cs.interval_violations;
             bool cat_applicable = si_monitor.scrambling_detected();
-            check_line(out, "2.7", "CAT",
+            check_line(out, "2.6", "CAT",
                        cat_err, cat_applicable);
         }
 
@@ -380,78 +383,78 @@ private:
         out << "  TR 101 290 — PRIORITY 3 (extended monitoring)\n";
         separator(out);
 
-        // P3.1 NIT actual
+        // 3.1a NIT actual
         {
             auto& ns = si_monitor.nit_actual_stats();
-            int64_t nit_err = ns.interval_violations + ns.crc_errors;
+            int64_t nit_err = ns.interval_violations;
             std::string detail = si_monitor.nit_is_disabled() ? "disabled (--no-nit)" : "";
-            check_line(out, "3.1", "NIT Actual",
+            check_line(out, "3.1a", "NIT Actual",
                        nit_err, !si_monitor.nit_is_disabled(), detail);
         }
 
-        // P3.2 NIT other
+        // 3.1b NIT other
         {
             auto& ns = si_monitor.nit_other_stats();
             bool seen = ns.seen_at_least_once;
-            int64_t nit_err = ns.interval_violations + ns.crc_errors;
+            int64_t nit_err = ns.interval_violations;
             bool applicable = seen && !si_monitor.nit_is_disabled();
             std::string detail = si_monitor.nit_is_disabled() ? "disabled (--no-nit)" : "";
-            check_line(out, "3.2", "NIT Other",
+            check_line(out, "3.1b", "NIT Other",
                        nit_err, applicable, detail);
         }
 
-        // P3.4 Unreferenced PID
+        // 3.4 Unreferenced PID
         check_line_info(out, "3.4", "Unreferenced PIDs",
                         static_cast<int64_t>(unreferenced_pids.size()));
 
-        // P3.5 SDT actual
+        // 3.5a SDT actual
         {
             auto& ss = si_monitor.sdt_actual_stats();
-            int64_t sdt_err = ss.interval_violations + ss.crc_errors;
-            check_line(out, "3.5", "SDT Actual",
+            int64_t sdt_err = ss.interval_violations;
+            check_line(out, "3.5a", "SDT Actual",
                        sdt_err, true);
         }
 
-        // P3.6 SDT other
+        // 3.5b SDT other
         {
             auto& ss = si_monitor.sdt_other_stats();
             bool seen = ss.seen_at_least_once;
-            int64_t sdt_err = ss.interval_violations + ss.crc_errors;
-            check_line(out, "3.6", "SDT Other",
+            int64_t sdt_err = ss.interval_violations;
+            check_line(out, "3.5b", "SDT Other",
                        sdt_err, seen);
         }
 
-        // P3.7 EIT actual p/f — mandatory, ERROR if absent or interval > 2s
+        // 3.6a EIT actual p/f — mandatory, ERROR if absent or interval > 2s
         {
             auto& es = si_monitor.eit_actual_pf_stats();
-            int64_t eit_err = es.interval_violations + es.crc_errors;
+            int64_t eit_err = es.interval_violations;
             std::string detail = si_monitor.eit_is_disabled() ? "disabled (--no-eit)" : "";
-            check_line(out, "3.7", "EIT Actual P/F",
+            check_line(out, "3.6a", "EIT Actual P/F",
                        eit_err, !si_monitor.eit_is_disabled(), detail);
         }
 
-        // P3.8 EIT other p/f — optional, WARN only
+        // 3.6b EIT other p/f — optional, WARN only
         if (si_monitor.eit_is_disabled()) {
-            check_line(out, "3.8", "EIT Other P/F", 0, false,
+            check_line(out, "3.6b", "EIT Other P/F", 0, false,
                        "disabled (--no-eit)");
         } else {
             auto& es = si_monitor.eit_other_pf_stats();
             if (es.seen_at_least_once) {
-                int64_t eit_w = es.interval_violations + es.crc_errors;
+                int64_t eit_w = es.interval_violations;
                 if (eit_w > 0)
-                    check_line_warn(out, "3.8", "EIT Other P/F",
+                    check_line_warn(out, "3.6b", "EIT Other P/F",
                                     eit_w, "interval limit 20s");
                 else
-                    check_line(out, "3.8", "EIT Other P/F",
+                    check_line(out, "3.6b", "EIT Other P/F",
                                0, true);
             } else {
-                check_line(out, "3.8", "EIT Other P/F", 0, false);
+                check_line(out, "3.6b", "EIT Other P/F", 0, false);
             }
         }
 
-        // P3.9 EIT actual schedule — optional, per sub-table, WARN only
+        // EIT.sch_act EIT actual schedule — optional, per sub-table, WARN only
         if (si_monitor.eit_is_disabled()) {
-            check_line(out, "3.9", "EIT Actual Schedule", 0, false,
+            check_line(out, "EIT.sch_act", "EIT Actual Schedule", 0, false,
                        "disabled (--no-eit)");
         } else {
             auto agg = si_monitor.eit_actual_sch_aggregated();
@@ -461,19 +464,19 @@ private:
                     detail += ", " + std::to_string(agg.sub_tables_with_violations)
                             + " exceed 10s limit"
                             + " (worst " + format_ms(agg.worst_max_interval) + ")";
-                int64_t total_w = agg.total_interval_violations + agg.total_crc_errors;
+                int64_t total_w = agg.total_interval_violations;
                 if (total_w > 0)
-                    check_line_warn(out, "3.9", "EIT Actual Schedule", total_w, detail);
+                    check_line_warn(out, "EIT.sch_act", "EIT Actual Schedule", total_w, detail);
                 else
-                    check_line(out, "3.9", "EIT Actual Schedule", 0, true, detail);
+                    check_line(out, "EIT.sch_act", "EIT Actual Schedule", 0, true, detail);
             } else {
-                check_line(out, "3.9", "EIT Actual Schedule", 0, false);
+                check_line(out, "EIT.sch_act", "EIT Actual Schedule", 0, false);
             }
         }
 
-        // P3.10 EIT other schedule — optional, per sub-table, WARN only
+        // EIT.sch_oth EIT other schedule — optional, per sub-table, WARN only
         if (si_monitor.eit_is_disabled()) {
-            check_line(out, "3.10", "EIT Other Schedule", 0, false,
+            check_line(out, "EIT.sch_oth", "EIT Other Schedule", 0, false,
                        "disabled (--no-eit)");
         } else {
             auto agg = si_monitor.eit_other_sch_aggregated();
@@ -482,39 +485,39 @@ private:
                 if (agg.sub_tables_with_violations > 0)
                     detail += ", " + std::to_string(agg.sub_tables_with_violations)
                             + " exceed 10s limit";
-                int64_t total_w = agg.total_interval_violations + agg.total_crc_errors;
+                int64_t total_w = agg.total_interval_violations;
                 if (total_w > 0)
-                    check_line_warn(out, "3.10", "EIT Other Schedule", total_w, detail);
+                    check_line_warn(out, "EIT.sch_oth", "EIT Other Schedule", total_w, detail);
                 else
-                    check_line(out, "3.10", "EIT Other Schedule", 0, true, detail);
+                    check_line(out, "EIT.sch_oth", "EIT Other Schedule", 0, true, detail);
             } else {
-                check_line(out, "3.10", "EIT Other Schedule", 0, false);
+                check_line(out, "EIT.sch_oth", "EIT Other Schedule", 0, false);
             }
         }
 
-        // P3.12 TDT error
+        // 3.8 TDT error
         {
             auto& ts = si_monitor.tdt_stats();
             int64_t tdt_err = ts.interval_violations;
-            check_line(out, "3.12", "TDT",
+            check_line(out, "3.8", "TDT",
                        tdt_err, true);
         }
 
-        // P3.13 Empty buffer error (T-STD underflow)
+        // TSTD.under Empty buffer error (T-STD underflow)
         {
             int64_t tstd_uf = 0;
             for (auto& [pid, st] : stats)
                 tstd_uf += st.tstd_underflows;
-            check_line(out, "3.13", "Empty Buffer (T-STD)",
+            check_line(out, "TSTD.under", "T-STD buffer underflow",
                        tstd_uf, !is_file);
         }
 
-        // P3.14 Data delay error (T-STD overflow)
+        // TSTD.over Data delay error (T-STD overflow)
         {
             int64_t tstd_of = 0;
             for (auto& [pid, st] : stats)
                 tstd_of += st.tstd_overflows;
-            check_line(out, "3.14", "Data Delay (T-STD)",
+            check_line(out, "TSTD.over", "T-STD buffer overflow",
                        tstd_of, !is_file);
         }
 
@@ -595,6 +598,9 @@ private:
             }
         }
 
+        if (st2022 && st2022->enabled)
+            St2022Report::full(out, *st2022);
+
         // ════════════════════════════════════════════════════════════════
         //  DETAILED PCR ANALYSIS PER PID
         // ════════════════════════════════════════════════════════════════
@@ -617,13 +623,12 @@ private:
                 << (st.estimated_bitrate / 1e6) << " Mbit/s\n\n";
 
             // ── PCR Interval ────────────────────────────────────────
-            out << "  +-  PCR INTERVAL (TR 101 290 P1.4) -----------------\n";
+            out << "  +-  PCR INTERVAL (TR 101 290 2.3a) -----------------\n";
             if (st.interval_count > 0)
             {
-                bool interval_ok = (st.pcr_interval_hard_err == 0);
+                bool interval_ok = (st.pcr_interval_err == 0);
 
                 double intv_limit = analyzer.pcr_interval_limit();
-                bool custom_limit = (intv_limit != TR101290_PCR_INTERVAL_MAX_S);
 
                 out << "  |  Samples     : " << st.interval_count << "\n"
                     << "  |  Min         : " << format_ms(st.interval_min) << "\n"
@@ -632,7 +637,7 @@ private:
                     << "  |  95th pctl   : " << format_ms(st.interval_p95()) << "\n"
                     << "  |  Limits      : " << format_ms(ISO13818_PCR_HARD_MAX_S)
                     << " (ISO hard), " << format_ms(intv_limit)
-                    << " (TR 101 290" << (custom_limit ? " custom" : "") << "), "
+                    << " (TR 101 290), "
                     << format_ms(TR101290_PCR_INTERVAL_REC_S) << " (rec)\n"
                     << "  |  Violations  : " << st.pcr_interval_hard_err
                     << " (>" << format_ms(ISO13818_PCR_HARD_MAX_S) << " ISO), "
@@ -647,7 +652,7 @@ private:
             out << "  +---------------------------------------------------\n\n";
 
             // ── PCR Accuracy ────────────────────────────────────────
-            out << "  +-  PCR ACCURACY (TR 101 290 P2.5) -----------------\n";
+            out << "  +-  PCR ACCURACY (TR 101 290 2.4) -----------------\n";
             if (is_file)
             {
                 out << "  |  Not measured (file mode — no reference clock)\n";
@@ -788,7 +793,7 @@ private:
         {
             out << "\n";
             separator(out, '-');
-            out << "  PTS INTERVAL DETAILS (TR 101 290 P2.6)\n";
+            out << "  PTS INTERVAL DETAILS (TR 101 290 2.5)\n";
             separator(out, '-');
             for (auto& [es_pid, ps] : pts_analyzer.stats())
             {
@@ -825,7 +830,8 @@ private:
             const std::string &source,
             double duration_s,
             const char *time_str,
-            bool all_pass)
+            bool all_pass,
+            const St2022Summary *st2022)
     {
         const auto &stats = analyzer.stats();
         const auto &programs = si.programs();
@@ -840,11 +846,11 @@ private:
         // TR 101 290 summary line
         out << "  P1: sync=" << ts_stats.sync_byte_errors
             << " CC=" << ts_stats.cc_errors
-            << " PAT=" << (si_monitor.pat_stats().interval_violations + si_monitor.pat_stats().crc_errors);
+            << " PAT=" << (si_monitor.pat_stats().interval_violations);
         {
             int64_t pmt_err = 0;
             for (auto& [pid, st] : si_monitor.pmt_stats())
-                pmt_err += st.interval_violations + st.crc_errors;
+                pmt_err += st.interval_violations;
             out << " PMT=" << pmt_err;
         }
         out << " PID=" << ts_stats.pid_absence_errors;
@@ -857,16 +863,13 @@ private:
         if (si_monitor.nit_is_disabled())
             out << "off";
         else
-            out << (si_monitor.nit_actual_stats().interval_violations
-                    + si_monitor.nit_actual_stats().crc_errors);
-        out << " SDT=" << (si_monitor.sdt_actual_stats().interval_violations
-                          + si_monitor.sdt_actual_stats().crc_errors)
+            out << (si_monitor.nit_actual_stats().interval_violations);
+        out << " SDT=" << (si_monitor.sdt_actual_stats().interval_violations)
             << " EIT=";
         if (si_monitor.eit_is_disabled())
             out << "off";
         else
-            out << (si_monitor.eit_actual_pf_stats().interval_violations
-                    + si_monitor.eit_actual_pf_stats().crc_errors);
+            out << (si_monitor.eit_actual_pf_stats().interval_violations);
         out << " TDT=" << si_monitor.tdt_stats().interval_violations
             << " unref=" << unreferenced_pids.size();
 
@@ -893,6 +896,8 @@ private:
                 out << "  " << Color::wrap(Color::YELLOW, "WARN");
             out << "\n";
         }
+        if (st2022 && st2022->enabled)
+            St2022Report::short_lines(out, *st2022);
 
         separator(out, '-', 100);
 
@@ -916,7 +921,7 @@ private:
 
         for (auto& [pid, st] : stats)
         {
-            bool intv_ok  = (st.pcr_interval_hard_err == 0 && st.interval_count > 0);
+            bool intv_ok  = (st.pcr_interval_err == 0 && st.interval_count > 0);
             bool acc_ok   = is_file ? true : (st.pcr_accuracy_err == 0);
             bool drift_in_spec = !drift_measured ? true : (std::abs(st.drift_ppm) <= 30.0);
 
