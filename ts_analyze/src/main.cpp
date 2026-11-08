@@ -94,7 +94,7 @@ static void print_usage(const char *prog)
             << "      --no-color         Disable ANSI color output for status verdicts\n"
             << "      --xml              Emit structured XML on stdout (quiet stderr)\n"
             << "      --json             Emit compact JSON on stdout: verdict, problems with times (quiet stderr)\n"
-            << "      --wait-s <s>       UDP: wait this long for the first datagram (default: 10)\n"
+            << "      --wait-s <s>       UDP: wait this long for the first datagram, and after a pause (default: 10)\n"
             << "  -V, --version          Show the version\n"
             << "  -h, --help             Show this help\n"
             << "\n" << "RTP, ST 2022-1 FEC, ST 2022-7 (udp:// input only; off by default):\n"
@@ -164,7 +164,7 @@ int main(int argc, char *argv[])
     bool   no_eit      = false;     // --no-eit: skip EIT analysis
     bool   no_nit      = false;     // --no-nit: skip NIT analysis
     St2022Options st2022;           // --rtp / --fec / --path2 / --path-skew-ms
-    double wait_s      = 10.0;      // --wait-s: live input, wait for the first datagram
+    double wait_s      = 10.0;      // --wait-s: live input, wait for the first datagram and after a pause
 
     // Long-only option codes (values outside short-option alphabet)
     enum { OPT_NO_COLOR = 1000, OPT_XML, OPT_NO_EIT, OPT_NO_NIT,
@@ -401,6 +401,9 @@ int main(int argc, char *argv[])
     std::set<uint16_t> expected_pids;
     expected_pids.insert(TS_PID_PAT);
 
+    // First and last packet time per PID: the JSON times of 3.4.
+    std::vector<double> pid_first(8192, -1.0), pid_last(8192, -1.0);
+
     // ── Main loop ───────────────────────────────────────────────────
     uint8_t pkt[TS_PACKET_SIZE];
     double arrival = 0;
@@ -427,6 +430,7 @@ int main(int argc, char *argv[])
             Events::get().set_origin(start_time);
             if (input->is_network())
             {
+                input->set_deadline(start_time + duration_s);
                 struct timespec rt;
                 clock_gettime(CLOCK_REALTIME, &rt);
                 start_utc = rt.tv_sec + rt.tv_nsec * 1e-9 - (monotonic_time() - start_time);
@@ -452,12 +456,19 @@ int main(int argc, char *argv[])
             continue;
         }
 
+        {
+            uint16_t pid = (uint16_t) (((pkt[1] & 0x1F) << 8) | pkt[2]);
+            if (pid_first[pid] < 0)
+                pid_first[pid] = elapsed;
+            pid_last[pid] = elapsed;
+        }
+
         // ── SI monitoring (every packet) ────────────────────────────
         si_monitor.process_packet(pkt, elapsed);
 
         // ── PTS monitoring ──────────────────────────────────────────
         if (pts_es_initialized)
-            pts_analyzer.process_packet(pkt);
+            pts_analyzer.process_packet(pkt, elapsed);
 
         // ── SI parsing phase: discover PCR PIDs ─────────────────────
         if (si_phase)
@@ -639,6 +650,10 @@ int main(int argc, char *argv[])
     }
 
     double actual_duration = started ? (arrival - start_time) : 0;
+    // A live input that ended in a pause: the pause is part of the analysed
+    // time (tables and PIDs missing in it are lost to the end).
+    if (started && input->ended_at() > arrival)
+        actual_duration = std::min(input->ended_at() - start_time, duration_s);
     if (!quiet)
         std::cerr << "\r  Captured " << pkt_count << " packets in " << std::fixed
                   << std::setprecision(2) << actual_duration << " s\n\n";
@@ -689,8 +704,19 @@ int main(int argc, char *argv[])
     // Compute unreferenced PIDs (3.4)
     std::set<uint16_t> unreferenced_pids =
         si_monitor.find_unreferenced_pids(analyzer.pid_bytes(), referenced_pids);
+    for (auto pid : unreferenced_pids)
+    {
+        Events::get().note("3.4", pid, "first packet", pid_first[pid]);
+        if (pid_last[pid] > pid_first[pid])
+            Events::get().note("3.4", pid, "last packet", pid_last[pid]);
+    }
 
-    if (analyzer.stats().empty())
+    // A PCR PID named by the PMT gets a stats entry from its first packet:
+    // what counts is whether any PCR value was seen.
+    bool any_pcr = false;
+    for (auto &[pid, st] : analyzer.stats())
+        any_pcr = any_pcr || st.pcr_count > 0;
+    if (!any_pcr)
     {
         std::cerr << "Error: no PCR data found in the stream.\n";
         if (json_mode)

@@ -18,6 +18,7 @@
 #include "ts_common.h"
 #include "tr101290_defs.h"
 
+#include <algorithm>
 #include <map>
 #include <vector>
 #include <cstdint>
@@ -50,6 +51,9 @@ struct PtsPidStats {
     double   pts_sum_interval_s   = 0;
 
     int64_t  last_pts             = -1;  // 90 kHz ticks
+    double   last_pts_t           = -1;  // stream time of the last PES with a PTS
+    double   first_pes_t          = -1;  // stream time of the first PES
+    bool     gap_counted          = false;   // this PTS-less run already raised 2.5
 
     double pts_avg_interval_s() const {
         return pts_count > 1
@@ -71,8 +75,10 @@ public:
         st.is_video    = is_video_type(stream_type);
     }
 
-    // Feed a raw 188-byte TS packet
-    void process_packet(const uint8_t* pkt) {
+    // Feed a raw 188-byte TS packet with its stream time
+    /// 2.5 from two sides: a PTS value step > 700 ms, and PES that keep coming without a PTS for > 700 ms of stream
+    /// time (counted once per run, which also suppresses the value step when the PTS returns).
+    void process_packet(const uint8_t* pkt, double t) {
         TsHeader h = parse_ts_header(pkt);
 
         auto it = stats_.find(h.pid);
@@ -113,18 +119,27 @@ public:
 
         // Optional PES header: byte 6 = flags, byte 7 = pts_dts_flags + others, byte 8 = header_data_length
         // (payload_len >= 9 already guaranteed above)
+        // A PES without a usable PTS: no PTS flag, or a PTS field cut short or with bad marker bits.
         uint8_t pts_dts_flags = (payload[7] >> 6) & 0x03;
-        if (pts_dts_flags == 0x00) return;  // no PTS
-
-        if (!(pts_dts_flags & 0x02)) return;  // PTS not present
-
         uint8_t header_data_len = payload[8];
-        if (payload_len < 9 + static_cast<int>(header_data_len)) return;
-        if (header_data_len < 5) return;
-
-        // Parse 5-byte PTS field at payload+9
-        int64_t pts = parse_pts_field(payload + 9);
-        if (pts < 0) return;
+        int64_t pts = -1;
+        if ((pts_dts_flags & 0x02) && header_data_len >= 5 && payload_len >= 9 + static_cast<int>(header_data_len))
+            pts = parse_pts_field(payload + 9);
+        if (st.first_pes_t < 0)
+            st.first_pes_t = t;
+        if (pts < 0) {
+            // TR 101 290 allows it up to 700 ms after the last PTS (or the first PES, for a PID that never had one).
+            double ref = st.last_pts_t >= 0 ? st.last_pts_t : st.first_pes_t;
+            if (!st.gap_counted && t - ref > TR101290_PTS_INTERVAL_MAX_S) {
+                st.gap_counted = true;
+                st.pts_interval_errors++;
+                if (Events::on())
+                    Events::get().note("2.5", h.pid, "PES without PTS for over "
+                                       + std::to_string((int) (TR101290_PTS_INTERVAL_MAX_S * 1e3)) + " ms",
+                                       ref + TR101290_PTS_INTERVAL_MAX_S);
+            }
+            return;
+        }
 
         st.pts_count++;
 
@@ -136,16 +151,21 @@ public:
                     st.pts_max_interval_s = interval;
                 st.pts_sum_interval_s += interval;
 
-                // 2.5: PTS interval > 700 ms
-                if (interval > TR101290_PTS_INTERVAL_MAX_S) {
+                // 2.5: PTS interval > 700 ms (not again for a PTS-less run already counted)
+                if (interval > TR101290_PTS_INTERVAL_MAX_S && !st.gap_counted) {
                     st.pts_interval_errors++;
+                    // Timed when the limit ran out after the last PTS (by stream time; never after this
+                    // PES, as a wrong -b hint can make the stream time shorter than the PTS step).
                     if (Events::on())
-                        Events::get().note("2.5", h.pid, "PTS interval " + std::to_string((int) (interval * 1e3)) + " ms");
+                        Events::get().note("2.5", h.pid, "PTS interval " + std::to_string((int) (interval * 1e3)) + " ms",
+                                           st.last_pts_t >= 0 ? std::min(t, st.last_pts_t + TR101290_PTS_INTERVAL_MAX_S) : -1);
                 }
             }
         }
 
         st.last_pts = pts;
+        st.last_pts_t = t;
+        st.gap_counted = false;
     }
 
     const std::map<uint16_t, PtsPidStats>& stats() const { return stats_; }

@@ -57,8 +57,9 @@ inline std::vector<St2022Check> st2022_checks(const St2022Summary &s)
             pd += (pd.empty() ? "path " : ", path ") + std::to_string(i + 1);
         }
     c.push_back({ "S.2", "RTP protocol errors", proto, true,
-                  pd.empty() ? "" : pd + ": not RTP or another payload type"
-                                    " (FEC in the media port is not supported)" });
+                  pd.empty() ? "" : pd + ": not RTP, or a payload type other than 33 (MP2T);"
+                                    " TS payloads of another type are still analysed, FEC in the media"
+                                    " port is not supported" });
 
     int64_t down = 0;
     std::string dd;

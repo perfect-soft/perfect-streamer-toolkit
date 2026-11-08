@@ -94,8 +94,22 @@ public:
 
         // 1.6 — PID presence tracking (not from a TEI packet: its PID
         // may be the corrupted part)
-        if (!tei && !bad_sync && expected_pids_.count(h.pid))
-            pid_last_seen_[h.pid] = stream_time;
+        if (!tei && !bad_sync && expected_pids_.count(h.pid)) {
+            // An absence that ends counts when the PID returns (one per gap);
+            // one lasting to the end is counted by check_pid_absence().
+            auto it = pid_last_seen_.find(h.pid);
+            if (it != pid_last_seen_.end()) {
+                if (stream_time - it->second > TR101290_PID_ABSENCE_MAX_S) {
+                    stats_.pid_absent_set.insert(h.pid);
+                    stats_.pid_absence_errors++;
+                    if (Events::on())
+                        Events::get().note("1.6", h.pid, "absent " + std::to_string((int) (stream_time - it->second))
+                                           + " s", it->second + TR101290_PID_ABSENCE_MAX_S);
+                }
+                it->second = stream_time;
+            } else
+                pid_last_seen_[h.pid] = stream_time;
+        }
 
         // Null packets: no CC check
         if (h.pid == TS_PID_NULL)

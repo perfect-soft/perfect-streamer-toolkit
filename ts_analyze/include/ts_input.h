@@ -52,8 +52,16 @@ public:
     // Stream time the input holds in seconds, or 0 when unknown (live).
     virtual double span_s() const { return 0.0; }
 
-    // Live inputs: how long to wait for the first datagram (--wait-s).
+    // Live inputs: how long to wait for the first datagram, and for more
+    // after a pause, before the input ends (--wait-s).
     virtual void set_first_wait(double /*seconds*/) {}
+
+    // Live inputs: the monotonic time -t ends at; a pause never waits past it.
+    virtual void set_deadline(double /*mono*/) {}
+
+    // Live inputs: when the input gave up (a pause past --wait-s, or the
+    // deadline reached in a pause), 0 if it did not.
+    virtual double ended_at() const { return 0.0; }
 
     // True for live network sources (UDP). False for file-based input.
     // Used to gate network-only metrics like IAT.
@@ -302,8 +310,10 @@ class TsUdpInput: public TsInput
     int buf_pos_ = 0;
     bool aligned_ = false;          // the TS payload is whole packets: serve by offset
     bool got_any_ = false;          // a datagram arrived
-    int first_wait_ms_ = 10000;     // wait for the first one; then 1 s of silence ends
+    int first_wait_ms_ = 10000;     // --wait-s: for the first one, and for more after a pause
     double dgram_arrival_ = 0;
+    double deadline_ = 0;           // -t's end (monotonic), 0 = none
+    double ended_at_ = 0;
 
     IatAnalyzer *iat_analyzer_ = nullptr;
 
@@ -321,7 +331,8 @@ public:
             close(sock_);
     }
 
-    /// Whole-packet datagrams are served by offset (a bad sync byte stays in place); waits --wait-s for the first datagram, then 1 s of silence ends the input.
+    /// Whole-packet datagrams are served by offset (a bad sync byte stays in place); waits --wait-s for the first datagram and again after
+    /// any pause (never past -t's deadline), so a stall shows as an IAT gap instead of ending the analysis.
     bool read_packet(uint8_t pkt[TS_PACKET_SIZE], double *arrival_time) override
     {
         while (true)
@@ -349,9 +360,20 @@ public:
             { };
             pfd.fd = sock_;
             pfd.events = POLLIN;
-            int ret = poll(&pfd, 1, got_any_ ? 1000 : first_wait_ms_);
+            int wait_ms = first_wait_ms_;
+            if (got_any_ && deadline_ > 0)
+                wait_ms = (int) std::min<double>(wait_ms, std::max(0.0, (deadline_ - monotonic_time()) * 1000 + 1));
+            int ret = poll(&pfd, 1, wait_ms);
             if (ret <= 0)
+            {
+                if (got_any_)
+                {
+                    ended_at_ = monotonic_time();
+                    if (iat_analyzer_)
+                        iat_analyzer_->add_silence(ended_at_);
+                }
                 return false;
+            }
             got_any_ = true;
 
             dgram_arrival_ = monotonic_time();
@@ -401,6 +423,8 @@ public:
     bool is_network() const override { return true; }
     void set_iat_analyzer(IatAnalyzer *a) override { iat_analyzer_ = a; }
     void set_first_wait(double s) override { first_wait_ms_ = (int) (s * 1000); }
+    void set_deadline(double mono) override { deadline_ = mono; }
+    double ended_at() const override { return ended_at_; }
 };
 
 // ─── Factory ────────────────────────────────────────────────────────

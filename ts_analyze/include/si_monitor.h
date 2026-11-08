@@ -217,8 +217,10 @@ public:
         flag_missing(sdt_actual_,    total_duration_s);
         if (!eit_disabled_) flag_missing(eit_actual_pf_, total_duration_s);
         flag_missing(tdt_,           total_duration_s);
+        // Only PMTs the last PAT still lists: a program dropped from the PAT is not a missing PMT.
         for (auto& [pid, st] : pmt_)
-            flag_missing(st, total_duration_s);
+            if (pat_pmt_pids_.empty() || pat_pmt_pids_.count(pid))
+                flag_missing(st, total_duration_s);
         if (scrambling_detected_)
             flag_missing(cat_, total_duration_s);
         // EIT schedule sub-tables: flag only those that were seen then went silent.
@@ -362,6 +364,18 @@ private:
         return agg;
     }
 
+    // The PMT PIDs of the latest valid PAT (section 0 starts the set anew).
+    void note_pat_programs(const uint8_t* section, int len) {
+        if (section[6] == 0)
+            pat_pmt_pids_.clear();
+        for (int i = 8; i + 4 <= len - 4; i += 4) {
+            uint16_t program = static_cast<uint16_t>((section[i] << 8) | section[i + 1]);
+            uint16_t pid = static_cast<uint16_t>(((section[i + 2] & 0x1F) << 8) | section[i + 3]);
+            if (program != 0)
+                pat_pmt_pids_.insert(pid);
+        }
+    }
+
     // Feed assembled bytes to the section buffer
     void feed_bytes(PsiAssembler& asmb, uint16_t pid,
                     const uint8_t* data, int len)
@@ -399,6 +413,8 @@ private:
 
         switch (pid) {
         case TS_PID_PAT:
+            if (table_id == 0x00 && len >= 12 && check_psi_crc(section, static_cast<size_t>(len)))
+                note_pat_programs(section, len);
             process_section(pat_, section, len, t, true);
             break;
         case TS_PID_CAT:
@@ -479,10 +495,12 @@ private:
             st.interval_count++;
             if (st.interval_limit_s > 0 && interval > st.interval_limit_s) {
                 st.interval_violations++;
+                // Timed when the table went missing (last + limit), not when it returned.
                 if (Events::on() && si_interval_check(st.name))
                     Events::get().note(si_interval_check(st.name), st.pid,
                                        st.name + " interval " + std::to_string((int) (interval * 1e3))
-                                       + " ms > " + std::to_string((int) (st.interval_limit_s * 1e3)) + " ms");
+                                       + " ms > " + std::to_string((int) (st.interval_limit_s * 1e3)) + " ms",
+                                       st.last_seen + st.interval_limit_s);
             }
         }
         st.last_seen          = t;
@@ -506,13 +524,26 @@ private:
         }
     }
 
+    /// End of analysis: a required table never seen, or seen and then lost for longer than its limit up to the end
+    /// (an interval that never closed), is one interval violation.
     void flag_missing(SiTableStats& st, double total_duration_s) {
-        if (!st.seen_at_least_once && st.interval_limit_s > 0) {
+        if (st.interval_limit_s <= 0)
+            return;
+        if (!st.seen_at_least_once) {
             if (total_duration_s > st.interval_limit_s) {
                 st.interval_violations++;
                 if (Events::on() && si_interval_check(st.name))
                     Events::get().note(si_interval_check(st.name), st.pid, st.name + " never seen", 0);
             }
+        } else if (total_duration_s - st.last_seen > st.interval_limit_s) {
+            double gap = total_duration_s - st.last_seen;
+            st.interval_violations++;
+            if (gap > st.max_interval)
+                st.max_interval = gap;
+            if (Events::on() && si_interval_check(st.name))
+                Events::get().note(si_interval_check(st.name), st.pid,
+                                   st.name + " absent for the last " + std::to_string((int) (gap * 1e3)) + " ms",
+                                   st.last_seen + st.interval_limit_s);
         }
     }
 
@@ -530,6 +561,7 @@ private:
 
     std::map<uint16_t, PsiAssembler> assemblers_;
     bool scrambling_detected_ = false;
+    std::set<uint16_t> pat_pmt_pids_;      // PMT PIDs the latest PAT lists
     bool nit_disabled_        = false;   // set by disable_nit()
     bool eit_disabled_        = false;   // set by disable_eit()
 };

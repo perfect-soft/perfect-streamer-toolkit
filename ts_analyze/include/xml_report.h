@@ -65,7 +65,7 @@ public:
         double ts_bitrate  = (duration_s > 0) ? (total_bytes * 8.0) / duration_s : 0;
 
         out << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
-        out << "<ts_analyze version=\"" << TS_ANALYZE_VERSION << "\">\n";
+        out << "<ts_analyze version=\"" << TS_ANALYZE_VERSION << "\" toolkit=\"" << TS_ANALYZE_TOOLKIT << "\">\n";
         out << "  <source>" << esc(source) << "</source>\n";
         out << "  <timestamp>" << time_buf << "</timestamp>\n";
         out << "  <duration_s>" << fmt(duration_s, 2) << "</duration_s>\n";
@@ -315,6 +315,27 @@ public:
                 }
             }
 
+            // decode lead vs the PCR, in ms; lead_warn = above lead_limit_ms (TSTD.lead)
+            auto lead_attrs = [&](const TstdEsBuffer& buf) {
+                if (!buf.lead_n) return;
+                out << "\" lead_min_ms=\"" << fmt(buf.lead_min * 1e3, 1)
+                    << "\" lead_avg_ms=\"" << fmt(buf.lead_avg() * 1e3, 1)
+                    << "\" lead_max_ms=\"" << fmt(buf.lead_max * 1e3, 1)
+                    << "\" lead_limit_ms=\"" << fmt(buf.lead_limit_s() * 1e3, 1)
+                    << "\" lead_iso_ms=\"" << fmt(buf.lead_iso_s() * 1e3, 1)
+                    << "\" lead_warn=\"" << buf.lead_episodes;
+            };
+            if (is_file) {
+                for (auto& [es_pid, buf] : analyzer.tstd_es_buffers()) {
+                    if (buf.pcr_pid != pid || !buf.lead_n) continue;
+                    out << "      <pes_lead es_pid=\"" << pid_hex(es_pid)
+                        << "\" stream_type=\"0x" << std::hex << std::setw(2)
+                        << std::setfill('0') << (int) buf.stream_type << std::dec;
+                    lead_attrs(buf);
+                    out << "\"/>\n";
+                }
+            }
+
             // T-STD
             if (!is_file) {
                 bool tstd_ok = (st.tstd_overflows == 0);
@@ -333,8 +354,10 @@ public:
                     if (buf.measuring) {
                         out << "\" es_bitrate_mbps=\"" << fmt(buf.drain_rate * 8.0 / 1e6, 3)
                             << "\" max_fill_bytes=\"" << fmt(buf.max_level, 0)
+                            << "\" overflow_limit_bytes=\"" << fmt(buf.overflow_limit(), 0)
                             << "\" overflows=\""  << buf.overflows
                             << "\" underflows=\"" << buf.underflows;
+                        lead_attrs(buf);
                     }
                     out << "\"/>\n";
                 }

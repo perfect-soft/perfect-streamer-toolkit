@@ -10,7 +10,10 @@
  * and report headers pick it up automatically.
  */
 
-#define TS_ANALYZE_VERSION "2.6"
+#define TS_ANALYZE_VERSION "2.6.2"
+
+// The attribution line of NOTICE; the XML root and the JSON object carry it too.
+#define TS_ANALYZE_TOOLKIT "Perfect Streamer Toolkit by Perfect Soft — https://meshwork.pstreamer.tv"
 
 inline const char *ts_analyze_version()
 {

@@ -29,10 +29,9 @@
  * Drift uses a separate regression of PCR time vs. wall-clock arrival
  * time — only meaningful in live mode.
  *
- * T-STD uses per-ES buffers with adaptive drain-rate estimation.
- * In network mode, timing uses a monotonic stream-time derived from
- * the global packet counter and PCR-estimated packet duration,
- * avoiding burst-induced artifacts from UDP arrival timestamps.
+ * T-STD uses per-ES buffers on the program clock: a PES's bytes leave
+ * at its DTS (else PTS). Each packet's time is interpolated between its
+ * two neighbouring PCRs by position, independent of arrival timestamps.
  */
 
 #include "events.h"
@@ -41,6 +40,7 @@
 
 #include <map>
 #include <set>
+#include <deque>
 #include <vector>
 #include <algorithm>
 #include <cmath>
@@ -95,6 +95,10 @@ struct PcrPidStats {
     // Last PCR state
     int64_t  last_pcr_raw     = -1;
     double   last_arrival     = -1;
+    int64_t  last_pcr_pkt     = -1;   // total_packets_ at the last PCR
+    double   pcr_time         = -1;   // the program clock at the last PCR (unwrapped seconds)
+    int      last_cc          = -1;   // CC of the last payload packet on this PID
+    bool     cc_break         = false;    // a CC break since the last PCR: packets were lost
     int64_t  bytes_since_pcr  = 0;
 
     // Bitrate estimation
@@ -121,6 +125,10 @@ struct PcrPidStats {
     double  dreg_sy  = 0;
     double  dreg_sxx = 0;
     double  dreg_sxy = 0;
+    std::deque<std::pair<double, double>> delay_win;   // (arrival, delivery delay) of the last 10 s
+
+    // ── PCR_AC rate: PCR time per packet of the last 15 intervals without a CC break ──
+    std::deque<double> acc_ratio;
 
     // ── Interval stats ──────────────────────────────────────────────
     double interval_avg() const {
@@ -165,9 +173,12 @@ struct PcrPidStats {
 
 // ─── Per-ES T-STD Buffer ────────────────────────────────────────────
 //
-// Models the multiplex buffer (MBn) from ISO/IEC 13818-1 §2.4.2.
-// Drain rate is estimated adaptively from the measured ES bitrate
-// after a warmup period, since we don't parse bitrate descriptors.
+// The elementary-stream buffer of the ISO/IEC 13818-1 §2.4.2 T-STD on the
+// program's clock: a PES's bytes enter when its packets arrive and leave at
+// its decode time (DTS, else PTS). Time is the program's PCR time, each
+// packet placed between its two neighbouring PCRs by position (exact for VBR),
+// so neither CPU load nor network bursts nor the -b hint move it. TBn (the 512 B transport buffer)
+// is not modelled.
 //
 // Each elementary stream gets its own buffer (keyed by ES PID).
 // Results are aggregated per PCR PID for reporting.
@@ -176,75 +187,172 @@ struct TstdEsBuffer {
     uint16_t es_pid   = 0;
     uint16_t pcr_pid  = 0;      // for aggregation into PcrPidStats
     uint8_t  stream_type = 0;   // ISO 13818-1 stream type
-    double   capacity = 0;      // bytes (BSn for this stream type)
-    double   level    = 0;      // current fill level (bytes)
-    double   last_t   = -1;     // last update time
-    double   drain_rate = 0;    // bytes/sec (estimated from ES bitrate)
-    bool     measuring = false; // true after warmup — start counting violations
+    double   capacity = 0;      // bytes (ISO BSn for this stream type; overflow_limit() judges)
+    double   level    = 0;      // bytes arrived and not yet decoded
+    double   drain_rate = 0;    // bytes/sec: the measured ES rate (reports)
+    bool     measuring = false; // the clock is known and a timed PES started
 
-    // Warmup tracking
-    int64_t  warmup_bytes  = 0;
-    double   warmup_start  = -1;
-
-    // Violation counters (only incremented after warmup)
-    int64_t  overflows  = 0;
-    int64_t  underflows = 0;
+    int64_t  overflows  = 0;    // episodes above the capacity
+    int64_t  underflows = 0;    // access units late or missing at their decode time
     double   max_level  = 0;
 
-    static constexpr double WARMUP_S = 1.0;  // 1 second warmup
+    // decode lead vs the program clock: decode time − arrival of each timed PES's first packet
+    int64_t  lead_n = 0;
+    double   lead_sum = 0, lead_min = 1e9, lead_max = -1e9;
+    int64_t  lead_episodes = 0; // episodes above lead_limit_s() (TSTD.lead, a warning)
+    double   lead_avg() const { return lead_n ? lead_sum / static_cast<double>(lead_n) : 0; }
 
     TstdEsBuffer() = default;
     TstdEsBuffer(uint16_t es, uint16_t pcr, uint8_t stype, double cap)
         : es_pid(es), pcr_pid(pcr), stream_type(stype), capacity(cap) {}
 
-    // Single time argument: stream_t is the only clock used. Mixing
-    // wall_t (for warmup-elapsed) with stream_t (for drain) produced
-    // false underflows when burst arrival on loopback / mux jitter
-    // desynchronised the two clocks.
-    void input(double stream_t, int bytes) {
-        if (warmup_start < 0) warmup_start = stream_t;
-        warmup_bytes += bytes;
-
-        double elapsed = stream_t - warmup_start;
-
-        // ── Warmup phase: estimate drain rate ───────────────────────
+    /// A PES starts at `now` (PCR time, s). ts_valid: it carries a DTS/PTS, `dec` its decode time on the same clock.
+    void start_pes(double now, bool ts_valid, double dec) {
+        if (!ts_valid) {
+            // Untimed PES: decoded with the last timed one still queued (or at once).
+            cur_late_ = late_counted_ = false;
+            if (q_.empty())
+                q_.push_back({ now, 0.0 });
+            cur_open_ = true;
+            return;
+        }
         if (!measuring) {
-            if (elapsed >= WARMUP_S) {
-                drain_rate = static_cast<double>(warmup_bytes) / elapsed;
-                measuring = true;
-                // Reset buffer state — discard warmup accumulation
-                level   = 0;
-                last_t  = stream_t;
-            }
-            return;   // don't track violations during warmup
+            measuring = true;
+            t_first_ = now;
         }
+        // Lead: decode time minus the arrival of the PES's first packet.
+        const double lead = dec - now;
+        lead_n++;
+        lead_sum += lead;
+        lead_min = std::min(lead_min, lead);
+        lead_max = std::max(lead_max, lead);
+        if (t_last_ - t_first_ >= 1.0 && lead > lead_limit_s()) {
+            if (!lead_over_) {
+                lead_over_ = true;
+                lead_episodes++;
+                if (Events::on())
+                    Events::get().note("TSTD.lead", es_pid, "lead " + std::to_string((int) (lead * 1e3)) + " ms > "
+                                       + std::to_string((int) (lead_limit_s() * 1e3)) + " ms", ev_time(now));
+            }
+        } else
+            lead_over_ = false;
+        q_.push_back({ dec, 0.0 });
+        cur_open_ = true;
+        cur_late_ = dec <= now;     // already due when it starts: its bytes all come late
+        late_counted_ = false;
+        starved_ = false;
+    }
 
-        // ── Active measurement ──────────────────────────────────────
-        drain_to(stream_t);
+    /// TS payload bytes of the current PES arrive at `now`.
+    void input(double now, double bytes) {
+        if (!measuring || !cur_open_)
+            return;
+        bytes_ += bytes;
+        t_last_ = now;
+        if (t_last_ > t_first_)
+            drain_rate = bytes_ / (t_last_ - t_first_);
+        if (cur_late_) {
+            // Data of an access unit after its decode time: an underflow, once per PES.
+            if (!late_counted_) {
+                late_counted_ = true;
+                underflows++;
+                note_under(now, now, "access unit late");
+            }
+            return;
+        }
+        late_counted_ = false;
+        q_.back().bytes += bytes;
         level += bytes;
-
-        if (level > capacity) {
-            overflows++;
-            Events::get().note("TSTD.over", es_pid);
-        }
-        if (level > max_level) max_level = level;
-    }
-
-    void drain_to(double t) {
-        if (last_t < 0) { last_t = t; return; }
-        double dt = t - last_t;
-        if (dt > 0 && drain_rate > 0) {
-            level -= drain_rate * dt;
-            if (level < 0) {
-                if (measuring) {
-                    underflows++;
-                    Events::get().note("TSTD.under", es_pid);
-                }
-                level = 0;
+        if (level > max_level)
+            max_level = level;
+        // Judged once the rate is measured over 1 s (overflow_limit needs it).
+        if (t_last_ - t_first_ >= 1.0 && level > overflow_limit()) {
+            if (!over_) {
+                over_ = true;
+                overflows++;
+                if (Events::on())
+                    Events::get().note("TSTD.over", es_pid, std::to_string((int) level) + " B > "
+                                       + std::to_string((int) overflow_limit()) + " B", ev_time(now));
             }
-        }
-        last_t = t;
+        } else
+            over_ = false;
     }
+
+    /// Overflow is judged on the ISO BSn or 1 s of the ES's measured rate, whichever is larger: field
+    /// streams keep 0.5-0.7 s of audio ahead of its PTS, above the 3584 B of BSn, and decoders hold it. A gross early
+    /// delivery (more than 1 s ahead) still overflows; max_level next to capacity shows the real lead.
+    double overflow_limit() const { return std::max(capacity, drain_rate * 1.0); }
+
+    /// The same limits in seconds of lead at the ES's measured rate: practical = max(ISO BSn / rate, 1 s),
+    /// above it TSTD.lead warns; ISO = BSn / rate, for information. 0 while the rate is unknown.
+    double lead_limit_s() const { return drain_rate > 0 ? overflow_limit() / drain_rate : 0; }
+    double lead_iso_s() const { return drain_rate > 0 ? capacity / drain_rate : 0; }
+
+    /// Decodes everything due by `now`; an empty buffer past the next expected decode time is a starvation.
+    void decode_to(double now) {
+        while (!q_.empty() && q_.front().t <= now) {
+            const Au au = q_.front();
+            q_.pop_front();
+            if (q_.empty() && cur_open_) {
+                cur_late_ = true;           // the PES still arriving reached its decode time
+                late_counted_ = false;
+            }
+            level -= au.bytes;
+            if (last_dec_ >= 0) {
+                double d = au.t - last_dec_;
+                if (d > 0 && d < 2.0)
+                    period_ = period_ > 0 ? 0.9 * period_ + 0.1 * d : d;
+            }
+            last_dec_ = au.t;
+        }
+        if (level < 0)
+            level = 0;
+        if (level <= overflow_limit())
+            over_ = false;
+        // Not for PES private data (0x06): DVB subtitles come when there is something to show.
+        if (measuring && stream_type != 0x06 && q_.empty() && !starved_ && last_dec_ >= 0 && period_ > 0
+            && now > last_dec_ + std::max(1.5 * period_, 0.1)) {
+            starved_ = true;
+            underflows++;
+            note_under(now, last_dec_ + period_, "buffer empty at the next decode time");
+        }
+    }
+
+    /// The program clock jumped (PCR discontinuity or step): what is queued has no valid time any more.
+    void reset_clock() {
+        q_.clear();
+        level = 0;
+        cur_open_ = cur_late_ = late_counted_ = over_ = starved_ = false;
+        last_dec_ = -1;
+    }
+
+private:
+    struct Au { double t; double bytes; };      // decode time (PCR time, s), bytes in the buffer
+    std::deque<Au> q_;
+    bool   cur_open_ = false;       // q_.back() is the PES still arriving
+    bool   cur_late_ = false;       // ... and its decode time has passed
+    bool   late_counted_ = false;
+    bool   over_ = false;
+    bool   lead_over_ = false;
+    bool   starved_ = false;
+    double last_dec_ = -1, period_ = 0;
+    double bytes_ = 0, t_first_ = 0, t_last_ = 0;
+
+    // Event time: the current packet's analysis time (the PCR packet whose arrival replays the queue, program
+    // clock ref_) moved by the program-clock difference.
+    double ev_time(double at) const { return std::max(0.0, Events::get().now() + (at - ref_)); }
+    void note_under(double /*now*/, double at, const char *what) const {
+        if (Events::on())
+            Events::get().note("TSTD.under", es_pid, what, ev_time(at));
+    }
+
+public:
+    double ref_ = 0;                // program clock of the current packet (set by the analyzer)
+    int    last_cc_ = -1;           // CC of the last payload packet of this ES (set by the analyzer)
+
+    /// Packets of this ES were lost (a CC break): the PES arriving is incomplete and the bytes up to the next PES
+    /// start belong to an unknown access unit (its header may be what was lost), so they are not counted as late.
+    void lose() { cur_open_ = cur_late_ = late_counted_ = false; }
 };
 
 // ─── Buffer capacity lookup (ISO/IEC 13818-1 Table 2-36) ───────────
@@ -260,12 +368,12 @@ inline double tstd_buffer_capacity(uint8_t stream_type) {
         return 30000000.0 / 8;           // conservative
     case 0x10:                           // MPEG-4 Visual
         return 6000000.0 / 8;            // 750 KB
-    case 0x03: case 0x04:                // MPEG-2 Audio
-        return 3584;                     // Bn for audio
-    case 0x0F:                           // AAC
-        return 8192;
-    case 0x11:                           // MPEG-4 AAC
-        return 8192;
+    case 0x03: case 0x04:                // MPEG-1/2 Audio
+        return 3584;                     // BSn for audio
+    case 0x0F:                           // AAC (ISO/IEC 13818-7)
+        return 3584;
+    case 0x11:                           // MPEG-4 AAC (LATM)
+        return 3584;
     case 0x06:                           // PES private (subtitles, etc.)
         return 65536;
     default:
@@ -303,6 +411,16 @@ public:
         st.pid = h.pid;
         st.total_packets++;
 
+        // CC since the last PCR: a break means packets were lost, so a long PCR
+        // difference is a gap in the delivery, not a value step (pcr_step).
+        if (pkt[3] & 0x10) {
+            const int cc = pkt[3] & 0x0F;
+            const bool di = (pkt[3] & 0x20) && pkt[4] > 0 && (pkt[5] & 0x80);
+            if (st.last_cc >= 0 && !di && cc != st.last_cc && cc != ((st.last_cc + 1) & 0x0F))
+                st.cc_break = true;
+            st.last_cc = cc;
+        }
+
         PcrValue pcr = extract_pcr(pkt);
         if (!pcr.valid) {
             st.bytes_since_pcr += TS_PACKET_SIZE;
@@ -314,9 +432,12 @@ public:
         // ── Discontinuity handling ──────────────────────────────────
         if (pcr.discontinuity) {
             st.discontinuities++;
+            set_program_clock(st, pcr.raw, true, 0);
             st.last_pcr_raw    = pcr.raw;
             st.last_arrival    = arrival_time;
+            st.last_pcr_pkt    = total_packets_;
             st.bytes_since_pcr = 0;
+            st.cc_break        = false;
             // Reset clock models — PCR clock has jumped
             reset_regression(st);
             return;     // skip interval/accuracy check on discontinuity
@@ -325,6 +446,16 @@ public:
         // ── PCR Interval ────────────────────────────────────────────
         if (st.last_pcr_raw >= 0) {
             double pcr_delta = PcrValue::delta_seconds(pcr.raw, st.last_pcr_raw);
+
+            if (pcr_step(st, pcr_delta, arrival_time, h.pid)) {
+                set_program_clock(st, pcr.raw, true, 0);
+                st.last_pcr_raw    = pcr.raw;
+                st.last_arrival    = arrival_time;
+                st.last_pcr_pkt    = total_packets_;
+                st.bytes_since_pcr = 0;
+                st.cc_break        = false;
+                return;
+            }
 
             // Sanity: ignore absurdly large deltas (likely stream errors)
             if (pcr_delta > 0 && pcr_delta < 2.0) {
@@ -383,9 +514,10 @@ public:
                 // Regress cumulative PCR seconds (y) against global
                 // packet number (x). For a CBR mux, x is exactly
                 // proportional to wall-clock time, so the regression
-                // slope = 1/TR (absorbs any systematic rate). Residuals
-                // therefore isolate the encoder PCR clock noise from
-                // both network jitter (live) and assumed bitrate (file).
+                // slope = 1/TR (absorbs any systematic rate). Each PCR is
+                // then judged against the previous one plus the packets
+                // between at that rate, free of network jitter (live)
+                // and of the assumed bitrate (file).
 
                 if (st.first_pkt_num < 0)
                     st.first_pkt_num = total_packets_;
@@ -408,10 +540,30 @@ public:
                     double denom = n * st.reg_sxx - st.reg_sx * st.reg_sx;
                     if (std::abs(denom) > 1e-18) {
                         double slope     = (n * st.reg_sxy - st.reg_sx * st.reg_sy) / denom;
-                        double intercept = (st.reg_sy - slope * st.reg_sx) / n;
-                        double predicted = slope * gx + intercept;
-                        double offset    = gy - predicted;
+                        // TR 101 290 PCR_AC: this PCR against the one expected from the previous PCR and the
+                        // packets between them at the regressed TS rate. Per interval, so one lost datagram is
+                        // at most one error, not a constant offset to the end (the old residual of the global
+                        // fit kept it); an interval with a CC break on this PID (packets lost) is not judged.
+                        // The rate is the median PCR time per packet of the last 15 intervals without a CC break
+                        // (the regression slope until 8 exist): a single loss is an outlier the median ignores, so
+                        // it biases nothing, while a clock that drifts moves the median along (drift is PCR.drift,
+                        // not an accuracy error).
+                        const double dn = static_cast<double>(total_packets_ - st.last_pcr_pkt);
+                        const bool judged = !st.cc_break && dn > 0;
+                        double rate = slope;
+                        if (st.acc_ratio.size() >= PCR_MIN_REG_SAMPLES) {
+                            std::vector<double> r(st.acc_ratio.begin(), st.acc_ratio.end());
+                            std::nth_element(r.begin(), r.begin() + r.size() / 2, r.end());
+                            rate = r[r.size() / 2];
+                        }
+                        double offset    = pcr_delta - dn * rate;
+                        if (judged) {
+                            st.acc_ratio.push_back(pcr_delta / dn);
+                            if (st.acc_ratio.size() > 15)
+                                st.acc_ratio.pop_front();
+                        }
 
+                        if (judged) {
                         st.accuracy_count++;
                         st.accuracy_sum    += offset;
                         st.accuracy_sq_sum += offset * offset;
@@ -425,15 +577,20 @@ public:
                             if (Events::on())
                                 Events::get().note("2.4", h.pid, "offset " + std::to_string((int) (offset * 1e9)) + " ns");
                         }
+                        }
 
-                        // Update T-STD pkt duration from regression slope
+                        // Packet duration for the program clock between PCRs (T-STD)
                         if (slope > 0)
                             tstd_pkt_dur_ = slope;
                     }
                 }
 
                 // ── Drift: arrival-time regression (live mode only) ──
-                if (!file_mode_) {
+                // A sample delivered off time (a stall's backlog; a datagram rebuilt by FEC) is skipped: its
+                // delivery delay (arrival − PCR time) is more than 50 ms off the median of the last 10 s. The
+                // estimate is used once it spans 10 s, so a fresh regression never replaces it from a few samples.
+                if (!file_mode_ && drift_sample_on_time(st, arrival_time - st.clock_ref_arrival - st.clock_cum_pcr,
+                                                        arrival_time)) {
                     double ax = arrival_time - st.clock_ref_arrival;
                     double ay = st.clock_cum_pcr;
 
@@ -443,7 +600,7 @@ public:
                     st.dreg_sxx += ax * ax;
                     st.dreg_sxy += ax * ay;
 
-                    if (st.dreg_n >= PCR_MIN_REG_SAMPLES) {
+                    if (st.dreg_n >= PCR_MIN_REG_SAMPLES && ax >= 10.0) {
                         double n = static_cast<double>(st.dreg_n);
                         double denom = n * st.dreg_sxx - st.dreg_sx * st.dreg_sx;
                         if (std::abs(denom) > 1e-18) {
@@ -455,9 +612,15 @@ public:
             }
         }
 
+        {
+            const double d = st.last_pcr_raw >= 0 ? PcrValue::delta_seconds(pcr.raw, st.last_pcr_raw) : -1;
+            set_program_clock(st, pcr.raw, !(d >= 0 && d < 2.0), d);
+        }
         st.last_pcr_raw    = pcr.raw;
         st.last_arrival    = arrival_time;
+        st.last_pcr_pkt    = total_packets_;
         st.bytes_since_pcr = 0;
+        st.cc_break        = false;
     }
 
     // ── Per-ES T-STD: initialize buffer for an elementary stream ─────
@@ -467,22 +630,10 @@ public:
     }
 
     // ── Per-ES T-STD: feed a packet belonging to this ES ────────────
-    void process_tstd_es_packet(uint16_t es_pid, const uint8_t* pkt, double arrival_time) {
+    void process_tstd_es_packet(uint16_t es_pid, const uint8_t* pkt, double /*arrival_time*/) {
         auto it = tstd_es_buffers_.find(es_pid);
-        if (it == tstd_es_buffers_.end()) return;
-
-        TsHeader h = parse_ts_header(pkt);
-        double stream_t = get_stream_time(arrival_time);
-
-        if (h.has_payload) {
-            int payload_size = TS_PACKET_SIZE - 4;
-            if (h.has_adaptation_field) {
-                int af_len = pkt[4];
-                payload_size -= (1 + af_len);
-            }
-            if (payload_size > 0)
-                it->second.input(stream_t, payload_size);
-        }
+        if (it != tstd_es_buffers_.end())
+            feed_tstd(it->second, pkt);
     }
 
     // ── Legacy per-PCR-PID T-STD (kept for fallback when no SI) ─────
@@ -492,22 +643,10 @@ public:
         tstd_legacy_buffers_[pcr_pid] = TstdEsBuffer(pcr_pid, pcr_pid, stype, cap);
     }
 
-    void process_tstd_packet(uint16_t pcr_pid, const uint8_t* pkt, double arrival_time) {
+    void process_tstd_packet(uint16_t pcr_pid, const uint8_t* pkt, double /*arrival_time*/) {
         auto it = tstd_legacy_buffers_.find(pcr_pid);
-        if (it == tstd_legacy_buffers_.end()) return;
-
-        TsHeader h = parse_ts_header(pkt);
-        double stream_t = get_stream_time(arrival_time);
-
-        if (h.has_payload) {
-            int payload_size = TS_PACKET_SIZE - 4;
-            if (h.has_adaptation_field) {
-                int af_len = pkt[4];
-                payload_size -= (1 + af_len);
-            }
-            if (payload_size > 0)
-                it->second.input(stream_t, payload_size);
-        }
+        if (it != tstd_legacy_buffers_.end())
+            feed_tstd(it->second, pkt);
     }
 
     const std::map<uint16_t, PcrPidStats>& stats() const { return stats_; }
@@ -527,6 +666,9 @@ public:
 
     // ── Finalize: aggregate per-ES T-STD stats into per-PCR-PID ─────
     void finalize() {
+        // What is still queued after the last PCR has no PCR after it to be timed by: it is not counted (the rule
+        // note's "between the PCR packets before and after"; an extrapolation set the lead of a file's last PES).
+        tstd_pending_.clear();
         // Aggregate per-ES buffers → per PCR PID
         for (auto& [es_pid, buf] : tstd_es_buffers_) {
             uint16_t pcr_pid = buf.pcr_pid;
@@ -580,11 +722,172 @@ private:
     // ── T-STD stream timing ─────────────────────────────────────────
     double  tstd_pkt_dur_ = 0;   // seconds per TS packet (from PCR regression)
 
-    double get_stream_time(double arrival_fallback) const {
-        if (file_mode_ || tstd_pkt_dur_ <= 0)
-            return arrival_fallback;
-        // Monotonic: total_packets_ × pkt_dur
-        return static_cast<double>(total_packets_) * tstd_pkt_dur_;
+    // ES packets since the last PCR of their program, replayed on its next PCR.
+    struct TstdPending {
+        TstdEsBuffer *buf;
+        int64_t pkt;            // total_packets_ at the packet
+        int bytes;              // TS payload bytes
+        bool pes_start;
+        int64_t ts;             // its DTS (else PTS), 90 kHz; -1 none
+        bool loss;              // a CC break before it on this ES
+    };
+    std::map<uint16_t, std::vector<TstdPending>> tstd_pending_;     // keyed by PCR PID
+
+    /// At each PCR of a program: its clock goes on by the PCR difference, and the ES packets queued since the last
+    /// PCR are replayed at times interpolated between the two PCRs by packet position. That is exact for a VBR mux
+    /// as well (a mux-wide average packet duration put AAC tens of ms off and read as late access units on a transcoder's
+    /// output). A jump (discontinuity, step, a gap > 2 s) drops the queue and restarts the program's buffers. So the
+    /// T-STD follows the PCR, not the arrival: CPU load, network bursts and the file -b hint do not move it.
+    void set_program_clock(PcrPidStats& st, int64_t raw, bool jumped, double d) {
+        if (st.pcr_time >= 0 && !jumped) {
+            replay(st.pid, st.pcr_time, st.last_pcr_pkt, st.pcr_time + d, total_packets_);
+            st.pcr_time += d;
+            return;
+        }
+        tstd_pending_[st.pid].clear();
+        if (st.pcr_time >= 0)
+            for (auto *bufs : { &tstd_es_buffers_, &tstd_legacy_buffers_ })
+                for (auto &[pid, b] : *bufs)
+                    if (b.pcr_pid == st.pid)
+                        b.reset_clock();
+        st.pcr_time = static_cast<double>(raw) / PCR_CLOCK_HZ;
+    }
+
+    // Replays a program's queue on [t0 at packet n0, t1 at packet n1], then decodes what is due at t1 (so a
+    // starved ES, with no packets of its own, is noticed at every PCR).
+    void replay(uint16_t pcr_pid, double t0, int64_t n0, double t1, int64_t n1) {
+        auto &q = tstd_pending_[pcr_pid];
+        for (auto &e : q) {
+            double t = n1 > n0 ? t0 + (t1 - t0) * static_cast<double>(e.pkt - n0) / static_cast<double>(n1 - n0) : t1;
+            TstdEsBuffer &b = *e.buf;
+            b.ref_ = t1;
+            b.decode_to(t);
+            if (e.loss)
+                b.lose();
+            if (e.pes_start) {
+                bool ok = false;
+                double dec = 0;
+                if (e.ts >= 0) {
+                    const double wrap = static_cast<double>(1LL << 33);
+                    double dd = static_cast<double>(e.ts) - std::fmod(t * 90000.0, wrap);
+                    if (dd > wrap / 2) dd -= wrap;
+                    if (dd < -wrap / 2) dd += wrap;
+                    dec = t + dd / 90000.0;
+                    ok = std::abs(dd / 90000.0) < 10.0;     // further off: not this clock
+                }
+                b.start_pes(t, ok, dec);
+            }
+            b.input(t, e.bytes);
+        }
+        q.clear();
+        for (auto *bufs : { &tstd_es_buffers_, &tstd_legacy_buffers_ })
+            for (auto &[pid, b] : *bufs)
+                if (b.pcr_pid == pcr_pid) {
+                    b.ref_ = t1;
+                    b.decode_to(t1);
+                }
+    }
+
+    static int64_t pes_timestamp(const uint8_t *d) {
+        if (!(d[0] & 0x01) || !(d[2] & 0x01) || !(d[4] & 0x01))
+            return -1;
+        return (static_cast<int64_t>((d[0] >> 1) & 0x07) << 30) | (static_cast<int64_t>(d[1]) << 22)
+             | (static_cast<int64_t>((d[2] >> 1) & 0x7F) << 15) | (static_cast<int64_t>(d[3]) << 7)
+             | static_cast<int64_t>((d[4] >> 1) & 0x7F);
+    }
+
+    // One ES packet: queued with its position (and, at a PES start, its DTS, else PTS) until the next PCR.
+    void feed_tstd(TstdEsBuffer &b, const uint8_t *pkt) {
+        auto it = stats_.find(b.pcr_pid);
+        if (it == stats_.end() || it->second.pcr_time < 0)
+            return;                 // no clock yet
+        TsHeader h = parse_ts_header(pkt);
+        if (!h.has_payload)
+            return;
+        int off = 4 + (h.has_adaptation_field ? 1 + pkt[4] : 0);
+        if (off >= TS_PACKET_SIZE)
+            return;
+        const bool di = h.has_adaptation_field && pkt[4] > 0 && (pkt[5] & 0x80);
+        const bool loss = b.last_cc_ >= 0 && !di && h.continuity_counter != b.last_cc_
+                          && h.continuity_counter != ((b.last_cc_ + 1) & 0x0F);
+        b.last_cc_ = h.continuity_counter;
+        int64_t ts = -1;
+        if (h.payload_unit_start) {
+            const uint8_t *p = pkt + off;
+            const int n = TS_PACKET_SIZE - off;
+            if (n >= 14 && p[0] == 0 && p[1] == 0 && p[2] == 1) {
+                const int flags = (p[7] >> 6) & 0x03;
+                if (flags == 3 && n >= 19 && p[8] >= 10)
+                    ts = pes_timestamp(p + 14);
+                else if ((flags & 0x02) && p[8] >= 5)
+                    ts = pes_timestamp(p + 9);
+            }
+        }
+        tstd_pending_[b.pcr_pid].push_back({ &b, total_packets_, TS_PACKET_SIZE - off, h.payload_unit_start, ts, loss });
+    }
+
+    /// An unflagged PCR value step: the difference to the last PCR is outside 0..100 ms (negative, or above 2 s, is a
+    /// step too), the PID's CC ran unbroken since the last PCR, and the difference does not match the transport time
+    /// between the two PCR packets: packet count × the regressed packet duration, and on live input at least their
+    /// arrival interval (a sender stall). It is 2.3b; 2.3a is judged on that transport interval, so a step alone is
+    /// not also a repetition error. A real gap (packets lost: a CC break, or a stall: the arrival interval) stays on
+    /// the normal path with 2.3a and 2.3b. The clock models go on across the step by the transport time.
+    bool pcr_step(PcrPidStats& st, double pcr_delta, double arrival_time, uint16_t pid) {
+        const double wrap = static_cast<double>(PCR_MAX + 1) / PCR_CLOCK_HZ;
+        double est = (tstd_pkt_dur_ > 0 && st.last_pcr_pkt >= 0)
+            ? static_cast<double>(total_packets_ - st.last_pcr_pkt) * tstd_pkt_dur_ : -1;
+        if (est > 0 && !file_mode_ && st.last_arrival >= 0)
+            est = std::max(est, arrival_time - st.last_arrival);
+        const bool out_of_range = !(pcr_delta > 0 && pcr_delta < 2.0);
+        if (st.cc_break || pcr_delta == 0)
+            return false;
+        if (!out_of_range && (pcr_delta <= 0.100 || est <= 0
+                              || std::abs(pcr_delta - est) <= std::max(0.010, 0.25 * est)))
+            return false;
+        const double step = pcr_delta > wrap / 2 ? pcr_delta - wrap : pcr_delta;
+        st.pcr_discont_ind_errors++;
+        if (Events::on())
+            Events::get().note("2.3b", pid, "PCR step " + std::to_string((int) (step * 1e3))
+                               + " ms without the discontinuity flag");
+        if (est > 0) {
+            st.interval_count++;
+            st.interval_sum += est;
+            if (est < st.interval_min) st.interval_min = est;
+            if (est > st.interval_max) st.interval_max = est;
+            st.interval_samples.push_back(est);
+            if (est > pcr_interval_limit_) {
+                st.pcr_interval_err++;
+                if (Events::on())
+                    Events::get().note("2.3a", pid, "PCR interval " + std::to_string((int) (est * 1e3))
+                                       + " ms (transport time; the PCR value stepped)");
+            }
+            if (est > ISO13818_PCR_HARD_MAX_S)
+                st.pcr_interval_hard_err++;
+            if (est > TR101290_PCR_INTERVAL_REC_S)
+                st.pcr_interval_warn++;
+            st.prev_pcr_delta = est;
+            // Accuracy and drift go on: the PCR time advances by the transport time, not by the step.
+            if (st.first_pkt_num >= 0)
+                st.clock_cum_pcr += est;
+        } else
+            reset_regression(st);       // too early to bridge the step: start the clock models anew
+        return true;
+    }
+
+    /// Drift input filter: a sample whose delivery delay (arrival − PCR time) is more than 50 ms off the median delay
+    /// of the last 10 s says nothing about the encoder clock: late ones queued behind a pause (a stall's backlog),
+    /// early ones stamped with a predecessor's arrival (datagrams rebuilt by FEC). The median, unlike the least
+    /// delay, is not moved by a few such samples.
+    static bool drift_sample_on_time(PcrPidStats& st, double delay, double arrival) {
+        st.delay_win.emplace_back(arrival, delay);
+        while (st.delay_win.front().first < arrival - 10.0)
+            st.delay_win.pop_front();
+        std::vector<double> d;
+        d.reserve(st.delay_win.size());
+        for (auto &[t, v] : st.delay_win)
+            d.push_back(v);
+        std::nth_element(d.begin(), d.begin() + d.size() / 2, d.end());
+        return std::abs(delay - d[d.size() / 2]) <= 0.050;
     }
 
     void reset_regression(PcrPidStats& st) {
@@ -594,6 +897,8 @@ private:
         st.reg_n = 0;
         st.reg_sx = st.reg_sy = st.reg_sxx = st.reg_sxy = 0;
         st.dreg_n = 0;
+        st.delay_win.clear();
+        st.acc_ratio.clear();
         st.dreg_sx = st.dreg_sy = st.dreg_sxx = st.dreg_sxy = 0;
         st.prev_pcr_delta = 0;
     }

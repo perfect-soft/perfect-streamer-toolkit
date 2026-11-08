@@ -740,9 +740,24 @@ private:
 
             // ── T-STD ───────────────────────────────────────────────
             out << "  +-  T-STD BUFFER MODEL (ISO 13818-1 S2.4.2) --------\n";
+            // decode lead vs the PCR: file and live, it runs on the PCR clock
+            auto print_lead = [&](const TstdEsBuffer& buf) {
+                if (!buf.lead_n) return;
+                out << "  |    Decode lead: min " << std::fixed << std::setprecision(1) << buf.lead_min * 1e3
+                    << " / avg " << buf.lead_avg() * 1e3 << " / max " << buf.lead_max * 1e3 << " ms; limit "
+                    << buf.lead_limit_s() * 1e3 << " ms (ISO " << buf.lead_iso_s() * 1e3 << " ms)"
+                    << (buf.lead_episodes ? "  WARN" : "") << "\n";
+            };
             if (is_file)
             {
                 out << "  |  Not measured (file mode — no real-time packet timing)\n";
+                for (auto *bufs : { &analyzer.tstd_es_buffers(), &analyzer.tstd_legacy_buffers() })
+                    for (auto& [es_pid, buf] : *bufs)
+                    {
+                        if (buf.pcr_pid != pid || !buf.lead_n) continue;
+                        out << "  |  ES PID " << format_pid(es_pid) << "  " << stream_type_label(buf.stream_type) << "\n";
+                        print_lead(buf);
+                    }
             }
             else
             {
@@ -754,7 +769,7 @@ private:
                         out << "  |  ES PID " << format_pid(es_pid) << "  "
                             << stream_type_label(buf.stream_type) << "\n";
                         out << "  |    Buffer cap : " << std::fixed << std::setprecision(0)
-                            << buf.capacity << " bytes\n";
+                            << buf.capacity << " bytes (ISO BSn)\n";
                         if (buf.measuring)
                         {
                             double drain_mbps = (buf.drain_rate * 8.0) / 1e6;
@@ -765,13 +780,16 @@ private:
                             if (buf.capacity > 0)
                                 out << " (" << std::setprecision(1)
                                     << (buf.max_level / buf.capacity * 100.0) << "%)";
-                            out << "\n";
+                            out << " of the ISO size\n";
+                            out << "  |    Over limit : " << std::fixed << std::setprecision(0)
+                                << buf.overflow_limit() << " bytes (ISO size or 1 s of the ES)\n";
+                            print_lead(buf);
                             out << "  |    Overflows  : " << buf.overflows << "\n";
                             out << "  |    Underflows : " << buf.underflows << "\n";
                         }
                         else
                         {
-                            out << "  |    (warmup not complete)\n";
+                            out << "  |    (no timed PES on the program clock yet)\n";
                         }
                     }
                 };

@@ -98,8 +98,8 @@ inline void full(std::ostream &out, const St2022Summary &s)
         if (s.fec)
             out << "  |    FEC       : " << p.fec_datagrams << " datagrams on port+2/+4\n";
         if (p.proto_errors)
-            out << "  |    Hint      : datagrams of another payload type on the media port"
-                   " (FEC in the media port is not supported)\n";
+            out << "  |    Hint      : datagrams not RTP or of a payload type other than 33 on the media port;"
+                   " TS payloads are still analysed, FEC in the media port is not supported\n";
     }
 
     out << "  |\n"

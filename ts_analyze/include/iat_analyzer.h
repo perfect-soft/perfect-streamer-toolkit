@@ -26,6 +26,8 @@
  * separate gap-count violation acts as a soft warning.
  */
 
+#include "events.h"
+
 #include <vector>
 #include <algorithm>
 #include <cmath>
@@ -50,11 +52,33 @@ public:
                 if (iat > max_iat_) max_iat_ = iat;
                 sum_    += iat;
                 sum_sq_ += iat * iat;
-                if (iat > IAT_GAP_THRESHOLD_S) gap_events_++;
+                if (iat > IAT_GAP_THRESHOLD_S) {
+                    gap_events_++;
+                    if (Events::on())
+                        Events::get().note("IAT.gap", -1, "no datagram for " + std::to_string((int) (iat * 1e3)) + " ms",
+                                           Events::get().rel(prev_t_));
+                }
             }
         }
         prev_t_ = t;
         count_++;
+    }
+
+    // The input ended in a pause at t: its silence since the last datagram is
+    // one more interval (a gap when long enough), with no datagram counted.
+    void add_silence(double t)
+    {
+        if (count_ == 0 || t - prev_t_ <= IAT_GAP_THRESHOLD_S)
+            return;
+        double iat = t - prev_t_;
+        intervals_.push_back(iat);
+        if (iat > max_iat_) max_iat_ = iat;
+        sum_    += iat;
+        sum_sq_ += iat * iat;
+        gap_events_++;
+        if (Events::on())
+            Events::get().note("IAT.gap", -1, "no datagram for the last " + std::to_string((int) (iat * 1e3)) + " ms",
+                               Events::get().rel(prev_t_));
     }
 
     int64_t datagram_count() const { return count_; }

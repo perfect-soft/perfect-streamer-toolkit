@@ -226,10 +226,20 @@ void RtpMerge::pushMedia(int l, const uchar* data, uint len, int64 now)
     if (l < 0 || l >= _p.legs)
         return;
     RtpHeader h;
-    if (!parseRtp(data, len, h) || h.pt != _p.payloadType || h.payloadLen == 0 || len - 12 > MaxRegion)
+    if (!parseRtp(data, len, h) || h.payloadLen == 0 || len - 12 > MaxRegion)
     {
         _leg[l].st.protoErrors++;
         return;
+    }
+    if (h.pt != _p.payloadType)
+    {
+        // Another payload type is a protocol error. ts_analyze: when the payload is still whole TS
+        // packets (a dynamic PT such as 96 for MP2T) it is counted and used, so the stream gets analysed; FEC in the
+        // media port and anything else is dropped.
+        _leg[l].st.protoErrors++;
+        const bool ts = _p.payloadType == 33 && h.payloadLen % TsPacket == 0 && data[h.payloadOff] == 0x47;
+        if (!ts)
+            return;
     }
     bucket(now);
     Leg & lg = _leg[l];

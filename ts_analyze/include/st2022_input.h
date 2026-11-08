@@ -100,8 +100,19 @@ public:
         {
             double now = monotonic_time();
             bool waiting = merge_->waiting();
-            if (!waiting && (last_any_ > 0 ? now - last_any_ >= 1.0 : now - opened_ >= first_wait_s_))
-                return false;       // 1 s of silence on every path (or none within --wait-s): the end
+            // The end: no datagram within --wait-s (first, or after a pause on every path), or -t's deadline
+            // reached in a pause. A shorter pause is a gap in the analysis, not its end.
+            if (!waiting && (last_any_ > 0 ? now - last_any_ >= first_wait_s_ || (deadline_ > 0 && now >= deadline_)
+                                           : now - opened_ >= first_wait_s_))
+            {
+                if (last_any_ > 0)
+                {
+                    ended_at_ = now;
+                    if (iat_main_)
+                        iat_main_->add_silence(now);
+                }
+                return false;
+            }
 
             std::vector<pollfd> pfds(fds_.size());
             for (size_t i = 0; i < fds_.size(); i++)
@@ -135,6 +146,8 @@ public:
     bool is_network() const override { return true; }
     void set_iat_analyzer(IatAnalyzer *a) override { iat_main_ = a; }
     void set_first_wait(double s) override { first_wait_s_ = s; }
+    void set_deadline(double mono) override { deadline_ = mono; }
+    double ended_at() const override { return ended_at_; }
 
     /// Totals for the reports and the verdict; `now` closes an open silence.
     St2022Summary summary(double now) const
@@ -431,6 +444,7 @@ private:
     IatAnalyzer *iat_main_ = nullptr;
     double opened_ = monotonic_time();
     double first_wait_s_ = 10.0;
+    double deadline_ = 0, ended_at_ = 0;
     double first_any_ = 0, last_any_ = 0, cur_now_ = 0, last_sample_ = 0;
     double last_out_t_ = 0;               // time of the last released TS packet
     bool verified_once_ = false;          // the paths were verified equal at least once

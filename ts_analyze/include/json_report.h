@@ -149,6 +149,7 @@ struct JsonReport
             { "EIT.sch_oth", "EIT_schedule_other", "EN 300 468 Annex C", "an EIT schedule other sub-table later than 10 s (optional)" },
             { "TSTD.under", "T-STD_underflow", "ISO/IEC 13818-1 2.4.2", "the T-STD buffer model of an elementary stream ran empty" },
             { "TSTD.over", "T-STD_overflow", "ISO/IEC 13818-1 2.4.2", "the T-STD buffer model of an elementary stream overflowed" },
+            { "TSTD.lead", "decode_lead", "ISO/IEC 13818-1 2.4.2", "an elementary stream is delivered further ahead of its decode time than its buffer limit allows" },
             { "SI.size", "Section_size_error", "ISO/IEC 13818-1, EN 300 468", "a PSI/SI section larger than its standard limit" },
             { "SI.eit1024", "EIT_section_over_1024", "EN 300 468 (receiver practice)", "EIT sections above 1024 bytes, which some set-top boxes reject" },
             { "PCR.drift", "PCR_drift", "ISO/IEC 13818-1 2.4.2.1", "PCR clock drift beyond 30 ppm" },
@@ -224,6 +225,10 @@ struct JsonReport
                     p.pids.push_back(pid);
                     d << (d.tellp() ? "; " : "") << "PID " << pid << ": " << std::fixed << std::setprecision(1)
                       << st.drift_ppm << " ppm";
+                    // Measured over the whole window: one event at its end.
+                    std::ostringstream e;
+                    e << std::fixed << std::setprecision(1) << st.drift_ppm << " ppm";
+                    Events::get().note("PCR.drift", pid, e.str(), duration_s);
                 }
             p.detail = d.str();
             if (p.count)
@@ -247,6 +252,17 @@ struct JsonReport
             warn("EIT.sch_oth", si_monitor.eit_other_sch_aggregated().total_interval_violations);
         }
         warn("SI.eit1024", si_monitor.total_eit_stb_warnings());
+        {
+            int64_t n = 0;
+            std::vector<int> pids;
+            for (auto *bufs : { &analyzer.tstd_es_buffers(), &analyzer.tstd_legacy_buffers() })
+                for (auto &[pid, b] : *bufs)
+                    if (b.lead_episodes) {
+                        n += b.lead_episodes;
+                        pids.push_back(pid);
+                    }
+            warn("TSTD.lead", n, pids);
+        }
         if (live)
             warn("IAT.gap", iat.gap_events(), {}, iat.interval_count() ? "max " + fmt_ms(iat.max()) : "");
 
@@ -259,6 +275,7 @@ struct JsonReport
             .str("schema", "ts_analyze/1")
             .str("tool", "ts_analyze")
             .str("version", TS_ANALYZE_VERSION)
+            .str("toolkit", TS_ANALYZE_TOOLKIT)
             .str("verdict", all_pass ? "PASS" : "FAIL")
             .integer("exit_code", all_pass ? 0 : 65)
             .str("source", source)
@@ -303,6 +320,7 @@ struct JsonReport
             .str("schema", "ts_analyze/1")
             .str("tool", "ts_analyze")
             .str("version", TS_ANALYZE_VERSION)
+            .str("toolkit", TS_ANALYZE_TOOLKIT)
             .str("verdict", "ERROR")
             .integer("exit_code", exit_code)
             .str("source", source)
@@ -504,6 +522,23 @@ private:
                 j.num("accuracy_abs_max_ns", s.accuracy_abs_max() * 1e9, 1);
             j.end();
         }
+        j.end();
+        // decode lead per ES vs the T-STD limit in ms of lead (file and live, on the PCR clock)
+        j.arr("tstd");
+        for (auto *bufs : { &analyzer.tstd_es_buffers(), &analyzer.tstd_legacy_buffers() })
+            for (auto &[pid, b] : *bufs)
+            {
+                if (!b.lead_n)
+                    continue;
+                char t[8];
+                snprintf(t, sizeof(t), "0x%02x", b.stream_type);
+                j.obj().integer("pid", pid).integer("pcr_pid", b.pcr_pid).str("type", t)
+                    .num("lead_min_ms", b.lead_min * 1e3).num("lead_avg_ms", b.lead_avg() * 1e3)
+                    .num("lead_max_ms", b.lead_max * 1e3).num("lead_limit_ms", b.lead_limit_s() * 1e3)
+                    .num("lead_iso_ms", b.lead_iso_s() * 1e3).num("es_rate_kbps", b.drain_rate * 8 / 1e3)
+                    .num("max_fill_bytes", b.max_level, 0).num("iso_bytes", b.capacity, 0)
+                    .num("limit_bytes", b.overflow_limit(), 0).end();
+            }
         j.end();
         if (live && iat.interval_count())
             j.obj("iat").integer("datagrams", iat.datagram_count()).num("avg_ms", iat.avg() * 1e3)
